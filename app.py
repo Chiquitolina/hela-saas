@@ -3963,7 +3963,7 @@ refresh_all_metadata()
 # ============================================================
 
 st.title(
-    "🍦 Control de Merma"
+    "🍦 Control"
 )
 
 st.caption(
