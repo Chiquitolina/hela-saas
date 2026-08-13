@@ -9,7 +9,7 @@ import shutil
 import uuid
 
 from models.lata import Lata
-from models.camera_stock import CameraStock
+from models.camera_lata import CameraLata
 from models.flavor import Flavor
 from models.week import Week, WEEK_COLUMNS, WEEK_METADATA_VERSION
 from services.flavor_service import (
@@ -30,6 +30,7 @@ from services.inventory_service import (
     load_camera_stock as load_camera_stock_file,
     load_salon_latas as load_salon_latas_file,
     migrate_legacy_inventory,
+    migrate_camera_stock_to_individual,
     split_inventory,
 )
 
@@ -174,6 +175,7 @@ def generate_id(prefix):
     APERTURA-000001
     FINALIZA-000001
     RECAMBIO-000001
+    ANULACION-CAMARA-000001
     """
 
     prefix = (
@@ -311,6 +313,54 @@ def generate_camera_id(
     )
 
 
+def generate_camera_ids(
+    sabor,
+    cantidad,
+):
+    flavor_code = get_flavor_code(
+        sabor
+    )
+
+    camera = load_camera_stock()
+
+    existing = (
+        camera[
+            "camera_stock_id"
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+        if (
+            not camera.empty
+            and "camera_stock_id"
+            in camera.columns
+        )
+        else []
+    )
+
+    ids = []
+
+    for _ in range(
+        int(
+            cantidad
+        )
+    ):
+        new_id = next_sequential_id(
+            existing,
+            f"CAM-{flavor_code}",
+        )
+
+        ids.append(
+            new_id
+        )
+
+        existing.append(
+            new_id
+        )
+
+    return ids
+
+
 def move_camera_flavor_to_salon(
     sabor,
     peso_bruto_kg,
@@ -330,10 +380,6 @@ def move_camera_flavor_to_salon(
         &
         (
             stock["active"] == True
-        )
-        &
-        (
-            stock["cantidad_latas"].fillna(0) > 0
         )
         &
         (
@@ -628,6 +674,20 @@ def initialize_files():
 
         movements_file=
             MOVEMENTS_FILE,
+
+        write_csv=
+            lambda df, path, allow_empty=True:
+                safe_write_csv(
+                    df,
+                    path,
+                    allow_empty=allow_empty,
+                ),
+    )
+
+    # Cámara ahora también se normaliza a una fila por lata física.
+    migrate_camera_stock_to_individual(
+        camera_file=
+            CAMERA_STOCK_FILE,
 
         write_csv=
             lambda df, path, allow_empty=True:
@@ -1969,6 +2029,11 @@ def add_camera_stock(
     kg_referencia_lata,
     notes="",
 ):
+    """
+    La UI puede cargar N latas juntas por comodidad,
+    pero internamente crea N CameraLata independientes.
+    """
+
     sabor = normalize_flavor_name(
         sabor
     )
@@ -1978,17 +2043,14 @@ def add_camera_stock(
             "Seleccioná un sabor."
         )
 
-    stock = load_current_stock()
-
-    timestamp = now_iso()
-
-    stock_id = generate_camera_id(
-        sabor
-    )
-
     cantidad_latas = int(
         cantidad_latas
     )
+
+    if cantidad_latas <= 0:
+        raise ValueError(
+            "La cantidad debe ser mayor a cero."
+        )
 
     kg_referencia_lata = round(
         float(
@@ -1999,40 +2061,49 @@ def add_camera_stock(
 
     if (
         kg_referencia_lata <= 0
-        or kg_referencia_lata > MAX_CAN_GROSS_KG
+        or kg_referencia_lata
+        > MAX_CAN_GROSS_KG
     ):
         raise ValueError(
             f"El peso de referencia debe estar entre "
-            f"0 y {MAX_CAN_GROSS_KG:.3f} kg. "
-            "Ejemplo: 7580 g se carga como 7.580 kg."
+            f"0 y {MAX_CAN_GROSS_KG:.3f} kg."
         )
 
-    camera_item = CameraStock.create(
-        camera_stock_id=
-            stock_id,
+    timestamp = now_iso()
 
-        sabor=
-            sabor,
-
-        cantidad_latas=
-            cantidad_latas,
-
-        kg_referencia_lata=
-            kg_referencia_lata,
-
-        timestamp=
-            timestamp,
+    camera_ids = generate_camera_ids(
+        sabor,
+        cantidad_latas,
     )
 
     camera = load_camera_stock()
+
+    new_rows = []
+
+    for camera_id in camera_ids:
+        camera_lata = CameraLata.create(
+            camera_stock_id=
+                camera_id,
+
+            sabor=
+                sabor,
+
+            kg_referencia_lata=
+                kg_referencia_lata,
+
+            timestamp=
+                timestamp,
+        )
+
+        new_rows.append(
+            camera_lata.to_row()
+        )
 
     camera = pd.concat(
         [
             camera,
             pd.DataFrame(
-                [
-                    camera_item.to_row()
-                ]
+                new_rows
             ),
         ],
         ignore_index=True,
@@ -2048,61 +2119,251 @@ def add_camera_stock(
 
     open_week = get_open_week()
 
-    append_row(
-        MOVEMENTS_FILE,
-        {
-            "movement_id":
-                generate_id("MOV"),
-
-            "timestamp":
-                timestamp,
-
-            "week_id":
-                (
-                    open_week["week_id"]
-                    if open_week is not None
-                    else pd.NA
-                ),
-
-            "movement_type":
-                "INGRESO_CAMARA",
-
-            "from_location":
-                "EXTERNO",
-
-            "to_location":
-                "CAMARA",
-
-            "source_stock_id":
-                pd.NA,
-
-            "target_stock_id":
-                stock_id,
-
-            "sabor":
-                sabor,
-
-            "cantidad_latas":
-                cantidad_latas,
-
-            "peso_bruto_kg":
-                pd.NA,
-
-            "tara_kg":
-                pd.NA,
-
-            "peso_neto_kg":
-                cantidad_latas
-                * kg_referencia_lata,
-
-            "notes":
-                notes,
-        }
+    week_id = (
+        open_week[
+            "week_id"
+        ]
+        if open_week is not None
+        else pd.NA
     )
 
-    return stock_id
+    operation_id = generate_id(
+        "INGRESO-CAMARA"
+    )
+
+    # Una fila de movimiento por lata física.
+    for camera_id in camera_ids:
+        append_row(
+            MOVEMENTS_FILE,
+            {
+                "movement_id":
+                    generate_id("MOV"),
+
+                "operation_id":
+                    operation_id,
+
+                "timestamp":
+                    timestamp,
+
+                "week_id":
+                    week_id,
+
+                "movement_type":
+                    "INGRESO_CAMARA",
+
+                "from_location":
+                    "EXTERNO",
+
+                "to_location":
+                    "CAMARA",
+
+                "source_stock_id":
+                    pd.NA,
+
+                "target_stock_id":
+                    camera_id,
+
+                "sabor":
+                    sabor,
+
+                "cantidad_latas":
+                    1,
+
+                "peso_bruto_kg":
+                    pd.NA,
+
+                "tara_kg":
+                    pd.NA,
+
+                "peso_neto_kg":
+                    kg_referencia_lata,
+
+                "tara_final_kg":
+                    pd.NA,
+
+                "residuo_final_kg":
+                    pd.NA,
+
+                "notes":
+                    notes,
+            }
+        )
+
+    return camera_ids
 
 
+def annul_camera_latas(
+    camera_stock_ids,
+    notes="",
+):
+    """
+    Anula una o varias latas DISPONIBLES de cámara.
+
+    No borra filas físicamente. Las deja:
+        estado = ANULADA
+        active = False
+
+    Además registra un movimiento ANULACION_CAMARA por lata,
+    todos bajo el mismo operation_id.
+    """
+
+    camera_stock_ids = [
+        str(
+            value
+        ).strip()
+        for value in camera_stock_ids
+        if str(
+            value
+        ).strip()
+    ]
+
+    if not camera_stock_ids:
+        raise ValueError(
+            "Seleccioná al menos una lata para anular."
+        )
+
+    camera = load_camera_stock()
+
+    if camera.empty:
+        raise ValueError(
+            "No hay latas en cámara."
+        )
+
+    timestamp = now_iso()
+
+    open_week = get_open_week()
+
+    week_id = (
+        open_week[
+            "week_id"
+        ]
+        if open_week is not None
+        else pd.NA
+    )
+
+    operation_id = generate_id(
+        "ANULACION-CAMARA"
+    )
+
+    annulled = []
+
+    for camera_stock_id in camera_stock_ids:
+        matches = camera[
+            camera[
+                "camera_stock_id"
+            ]
+            .astype(str)
+            .eq(
+                camera_stock_id
+            )
+        ]
+
+        if matches.empty:
+            raise ValueError(
+                f"No se encontró {camera_stock_id}."
+            )
+
+        idx = matches.index[0]
+
+        model = CameraLata.from_row(
+            camera.loc[
+                idx
+            ]
+        )
+
+        updates = model.annul_updates(
+            timestamp=
+                timestamp,
+        )
+
+        for field, value in updates.items():
+            camera.loc[
+                idx,
+                field
+            ] = value
+
+        append_row(
+            MOVEMENTS_FILE,
+            {
+                "movement_id":
+                    generate_id(
+                        "MOV"
+                    ),
+
+                "operation_id":
+                    operation_id,
+
+                "timestamp":
+                    timestamp,
+
+                "week_id":
+                    week_id,
+
+                "movement_type":
+                    "ANULACION_CAMARA",
+
+                "from_location":
+                    "CAMARA",
+
+                "to_location":
+                    "ANULADA",
+
+                "source_stock_id":
+                    camera_stock_id,
+
+                "target_stock_id":
+                    pd.NA,
+
+                "sabor":
+                    model.sabor,
+
+                "cantidad_latas":
+                    1,
+
+                "peso_bruto_kg":
+                    pd.NA,
+
+                "tara_kg":
+                    pd.NA,
+
+                "peso_neto_kg":
+                    model.kg_referencia_lata,
+
+                "tara_final_kg":
+                    pd.NA,
+
+                "residuo_final_kg":
+                    pd.NA,
+
+                "notes":
+                    notes,
+            }
+        )
+
+        annulled.append(
+            camera_stock_id
+        )
+
+    safe_write_csv(
+        camera[
+            CAMERA_COLUMNS
+        ],
+        CAMERA_STOCK_FILE,
+        allow_empty=True,
+    )
+
+    return {
+        "operation_id":
+            operation_id,
+
+        "cantidad":
+            len(
+                annulled
+            ),
+
+        "camera_stock_ids":
+            annulled,
+    }
 
 
 # ============================================================
@@ -2123,13 +2384,15 @@ def move_camera_to_salon(
     stock = load_current_stock()
 
     mask = (
-        stock["stock_id"]
+        stock[
+            "stock_id"
+        ]
         == camera_stock_id
     )
 
     if not mask.any():
         raise ValueError(
-            "No se encontró ese stock de cámara."
+            "No se encontró esa lata de cámara."
         )
 
     idx = stock[
@@ -2138,24 +2401,24 @@ def move_camera_to_salon(
 
     source = stock.loc[
         idx
-    ]
+    ].copy()
 
-    if not bool(
-        source["active"]
-    ):
+    if str(
+        source[
+            "location"
+        ]
+    ).upper() != "CAMARA":
         raise ValueError(
-            "Ese stock de cámara no está activo."
+            "El ID seleccionado no pertenece a cámara."
         )
 
-    available = int(
+    if not bool(
         source[
-            "cantidad_latas"
+            "active"
         ]
-    )
-
-    if available <= 0:
+    ):
         raise ValueError(
-            "No quedan latas disponibles."
+            "Esa lata de cámara ya no está disponible."
         )
 
     timestamp = now_iso()
@@ -2165,7 +2428,9 @@ def move_camera_to_salon(
     )
 
     sabor = normalize_flavor_name(
-        source["sabor"]
+        source[
+            "sabor"
+        ]
     )
 
     lata = Lata.create_salon(
@@ -2202,6 +2467,7 @@ def move_camera_to_salon(
             timestamp,
     )
 
+    # Creamos la lata de salón.
     stock = pd.concat(
         [
             stock,
@@ -2214,25 +2480,31 @@ def move_camera_to_salon(
         ignore_index=True,
     )
 
-    remaining = (
-        available - 1
-    )
+    # Marcamos la CameraLata específica como movida.
+    stock.loc[
+        idx,
+        "estado"
+    ] = "MOVIDA_SALON"
 
     stock.loc[
         idx,
-        "cantidad_latas"
-    ] = remaining
+        "moved_to_salon_at"
+    ] = timestamp
+
+    stock.loc[
+        idx,
+        "target_salon_stock_id"
+    ] = salon_id
 
     stock.loc[
         idx,
         "updated_at"
     ] = timestamp
 
-    if remaining <= 0:
-        stock.loc[
-            idx,
-            "active"
-        ] = False
+    stock.loc[
+        idx,
+        "active"
+    ] = False
 
     save_current_stock(
         stock
@@ -2254,8 +2526,11 @@ def move_camera_to_salon(
 
             "week_id":
                 (
-                    open_week["week_id"]
-                    if open_week is not None
+                    open_week[
+                        "week_id"
+                    ]
+                    if open_week
+                    is not None
                     else pd.NA
                 ),
 
@@ -3444,12 +3719,6 @@ def perform_salon_replacement(
             )
             &
             (
-                stock["cantidad_latas"]
-                .fillna(0)
-                > 0
-            )
-            &
-            (
                 stock["sabor"]
                 .map(
                     normalize_flavor_name
@@ -3501,12 +3770,6 @@ def perform_salon_replacement(
         camera_row = stock.loc[
             camera_idx
         ].copy()
-
-        available_qty = int(
-            camera_row[
-                "cantidad_latas"
-            ]
-        )
 
         new_salon_id = generate_salon_id(
             stock
@@ -3582,25 +3845,30 @@ def perform_salon_replacement(
             ignore_index=True,
         )
 
-        remaining = (
-            available_qty - 1
-        )
+        stock.loc[
+            camera_idx,
+            "estado"
+        ] = "MOVIDA_SALON"
 
         stock.loc[
             camera_idx,
-            "cantidad_latas"
-        ] = remaining
+            "moved_to_salon_at"
+        ] = timestamp
+
+        stock.loc[
+            camera_idx,
+            "target_salon_stock_id"
+        ] = new_salon_id
 
         stock.loc[
             camera_idx,
             "updated_at"
         ] = timestamp
 
-        if remaining <= 0:
-            stock.loc[
-                camera_idx,
-                "active"
-            ] = False
+        stock.loc[
+            camera_idx,
+            "active"
+        ] = False
 
         movement_rows.append(
             {
@@ -3963,7 +4231,7 @@ refresh_all_metadata()
 # ============================================================
 
 st.title(
-    "🍦 Control"
+    "🍦 Control de Merma"
 )
 
 st.caption(
@@ -4549,7 +4817,7 @@ with tab_stock:
 
     st.caption(
         "Persistencia separada: salon_latas.csv para latas individuales "
-        "y camera_stock.csv para stock agregado de cámara."
+        "y camera_stock.csv con una fila por lata física de cámara."
     )
 
     camera_tab, salon_tab = st.tabs(
@@ -4588,31 +4856,121 @@ with tab_stock:
             )
 
         else:
-            camera[
-                "kg_estimados"
-            ] = (
-                camera[
-                    "cantidad_latas"
-                ].fillna(0)
-                *
-                camera[
-                    "kg_referencia_lata"
-                ].fillna(0)
+            camera_editor = camera[
+                [
+                    "stock_id",
+                    "sabor",
+                    "estado",
+                    "kg_referencia_lata",
+                    "ingresada_camera_at",
+                ]
+            ].copy()
+
+            camera_editor.insert(
+                0,
+                "anular",
+                False,
             )
 
-            st.dataframe(
-                camera[
-                    [
-                        "stock_id",
-                        "sabor",
-                        "cantidad_latas",
-                        "kg_referencia_lata",
-                        "kg_estimados",
-                    ]
-                ],
+            edited_camera = st.data_editor(
+                camera_editor,
                 hide_index=True,
                 use_container_width=True,
+                disabled=[
+                    "stock_id",
+                    "sabor",
+                    "estado",
+                    "kg_referencia_lata",
+                    "ingresada_camera_at",
+                ],
+                column_config={
+                    "anular":
+                        st.column_config.CheckboxColumn(
+                            "🗑️ Anular",
+                            help=(
+                                "Marca una o más latas cargadas por error."
+                            ),
+                            default=False,
+                        ),
+
+                    "stock_id":
+                        st.column_config.TextColumn(
+                            "Lata"
+                        ),
+
+                    "kg_referencia_lata":
+                        st.column_config.NumberColumn(
+                            "Kg referencia",
+                            format="%.3f kg",
+                        ),
+
+                    "ingresada_camera_at":
+                        st.column_config.TextColumn(
+                            "Ingreso cámara"
+                        ),
+                },
+                key="camera_stock_editor",
             )
+
+            selected_to_annul = (
+                edited_camera.loc[
+                    edited_camera[
+                        "anular"
+                    ]
+                    == True,
+                    "stock_id",
+                ]
+                .astype(str)
+                .tolist()
+            )
+
+            if selected_to_annul:
+                st.warning(
+                    f"Vas a anular "
+                    f"{len(selected_to_annul)} "
+                    f"lata(s) de cámara. "
+                    "No se borran del historial."
+                )
+
+                annul_notes = st.text_input(
+                    "Motivo / observación de anulación",
+                    placeholder=(
+                        "Ej: carga duplicada, cantidad incorrecta..."
+                    ),
+                    key="camera_annul_notes",
+                )
+
+                confirm_annul = st.checkbox(
+                    "Confirmo que quiero anular las latas seleccionadas",
+                    key="confirm_camera_annul",
+                )
+
+                if st.button(
+                    "🗑️ Anular seleccionadas",
+                    key="annul_camera_selected",
+                    disabled=(
+                        not confirm_annul
+                    ),
+                ):
+                    try:
+                        result = annul_camera_latas(
+                            selected_to_annul,
+                            notes=
+                                annul_notes,
+                        )
+
+                        st.success(
+                            f"Se anularon "
+                            f"{result['cantidad']} lata(s) · "
+                            f"{result['operation_id']}"
+                        )
+
+                        st.rerun()
+
+                    except ValueError as e:
+                        st.error(
+                            str(e)
+                        )
 
         st.divider()
 
@@ -4660,6 +5018,11 @@ with tab_stock:
                         "Ejemplo: 7580 g = 7.580 kg."
                     ),
                 )
+
+            st.caption(
+                "Podés cargar varias juntas: si ponés 9, la app crea "
+                "9 IDs individuales CAM-xxx-xxxxxx."
+            )
 
             camera_notes = st.text_area(
                 "Observaciones",
@@ -5236,11 +5599,9 @@ with tab_stock:
             ].copy()
 
             camera_qty_for_flavor = int(
-                camera_same_flavor[
-                    "cantidad_latas"
-                ]
-                .fillna(0)
-                .sum()
+                len(
+                    camera_same_flavor
+                )
             )
 
             r1, r2, r3 = st.columns(
@@ -5584,13 +5945,6 @@ with tab_transfer:
             ]
             == True
         )
-        &
-        (
-            stock[
-                "cantidad_latas"
-            ].fillna(0)
-            > 0
-        )
     ].copy()
 
     if camera.empty:
@@ -5605,11 +5959,12 @@ with tab_transfer:
                 "sabor",
                 as_index=False,
             )
-            .agg(
-                cantidad_latas=(
-                    "cantidad_latas",
-                    "sum",
-                ),
+            .size()
+            .rename(
+                columns={
+                    "size":
+                        "cantidad_latas"
+                }
             )
             .sort_values(
                 "sabor"
@@ -5649,6 +6004,47 @@ with tab_transfer:
             flavor_options[
                 selected_label
             ]
+        )
+
+        selected_camera_rows = camera[
+            camera[
+                "sabor"
+            ]
+            .map(
+                normalize_flavor_name
+            )
+            .eq(
+                selected_flavor
+            )
+        ].copy()
+
+        selected_camera_rows[
+            "_created_dt"
+        ] = pd.to_datetime(
+            selected_camera_rows[
+                "created_at"
+            ],
+            errors="coerce",
+        )
+
+        selected_camera_rows = (
+            selected_camera_rows
+            .sort_values(
+                "_created_dt",
+                ascending=True,
+                na_position="last",
+            )
+        )
+
+        fifo_camera_id = (
+            selected_camera_rows
+            .iloc[0][
+                "stock_id"
+            ]
+        )
+
+        st.caption(
+            f"Se moverá por FIFO la lata {fifo_camera_id}."
         )
 
         p1, p2, p3 = st.columns(
