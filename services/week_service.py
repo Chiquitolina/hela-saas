@@ -1458,13 +1458,77 @@ def refresh_weeks_dataframe(
     rows = []
 
     for _, week_row in weeks_df.iterrows():
+
+        status = str(
+            week_row.get(
+                "status",
+                ""
+            )
+        ).upper()
+
+        end_salon_source = str(
+            week_row.get(
+                "end_salon_snapshot_source",
+                ""
+            )
+        )
+
+        end_camera_source = str(
+            week_row.get(
+                "end_camera_snapshot_source",
+                ""
+            )
+        )
+
+        # Las semanas cerradas mediante el nuevo cierre explícito
+        # son snapshots históricos definitivos.
+        #
+        # No deben volver a absorber cambios del stock actual,
+        # movimientos futuros ni nuevos refresh de metadata.
+        frozen_close = (
+            status
+            == "CLOSED"
+            and end_salon_source
+            == "LIVE_CLOSE_SNAPSHOT"
+            and end_camera_source
+            == "LIVE_CLOSE_SNAPSHOT"
+        )
+
+        if frozen_close:
+            frozen = week_row.copy()
+
+            for column in WEEK_COLUMNS:
+                if column not in frozen.index:
+                    frozen[
+                        column
+                    ] = pd.NA
+
+            rows.append(
+                {
+                    column:
+                        frozen[
+                            column
+                        ]
+                    for column in WEEK_COLUMNS
+                }
+            )
+
+            continue
+
         rows.append(
             enrich_week_row(
                 week_row,
-                stock_df=stock_df,
-                movements_df=movements_df,
-                counts_df=counts_df,
-                now_iso=now_iso,
+                stock_df=
+                    stock_df,
+
+                movements_df=
+                    movements_df,
+
+                counts_df=
+                    counts_df,
+
+                now_iso=
+                    now_iso,
             )
         )
 

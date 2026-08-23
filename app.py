@@ -6,10 +6,23 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import shutil
+import os
+import time
 import uuid
+import json
 
 from models.lata import Lata
 from models.camera_lata import CameraLata
+from models.camera_product import (
+    CameraProduct,
+    CATEGORY_CODES,
+    CATEGORY_SUBCATEGORIES,
+    PACKAGING_PACK_BOXES_UNITS,
+    PACKAGING_PACK_UNITS,
+    PACKAGING_BOX_UNITS,
+    PACKAGING_MODES,
+)
+from models.product import Product
 from models.flavor import Flavor
 from models.week import Week, WEEK_COLUMNS, WEEK_METADATA_VERSION
 from services.flavor_service import (
@@ -43,6 +56,23 @@ from services.week_service import (
 
 
 # ============================================================
+# WEEK PRODUCT SNAPSHOTS
+# ============================================================
+
+WEEK_PRODUCT_SNAPSHOT_COLUMNS = [
+    "start_products_snapshot_json",
+    "current_products_snapshot_json",
+    "end_products_snapshot_json",
+]
+
+for _column in WEEK_PRODUCT_SNAPSHOT_COLUMNS:
+    if _column not in WEEK_COLUMNS:
+        WEEK_COLUMNS.append(
+            _column
+        )
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -66,6 +96,8 @@ MAX_CAN_GROSS_KG = 20.0
 MAX_TARE_KG = 2.0
 DEFAULT_TARE_KG = 0.380
 DEFAULT_CAMERA_CAN_KG = 7.580
+GRIDO_NOMINAL_NET_KG = 7.800
+GRIDO_NOMINAL_TOLERANCE_KG = 0.050
 
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -81,6 +113,8 @@ BACKUP_DIR.mkdir(exist_ok=True)
 # Inventarios separados
 SALON_LATAS_FILE = DATA_DIR / "salon_latas.csv"
 CAMERA_STOCK_FILE = DATA_DIR / "camera_stock.csv"
+CAMERA_PRODUCTS_FILE = DATA_DIR / "camera_products.csv"
+PRODUCTS_FILE = DATA_DIR / "products.csv"
 
 # Archivo legacy: se conserva como fuente de migración/backup,
 # pero la app nueva ya NO lo usa como persistencia activa.
@@ -140,6 +174,18 @@ FLAVOR_COLUMNS = [
     "flavor_code",
     "active",
     "created_at",
+]
+
+
+CAMERA_PRODUCT_COLUMNS = [
+    "product_stock_id","product_code","categoria","subcategoria","producto","packaging_mode",
+    "cantidad_packs","cantidad_cajas","cajas_por_pack","unidades_por_pack","unidades_por_caja",
+    "total_cajas","total_unidades","created_at","updated_at","active",
+]
+
+PRODUCT_COLUMNS = [
+    "product_code","categoria","subcategoria","producto","packaging_mode",
+    "cajas_por_pack","unidades_por_pack","unidades_por_caja","active","created_at","updated_at",
 ]
 
 
@@ -468,16 +514,29 @@ def safe_write_csv(
     df,
     filepath,
     allow_empty=False,
+    retries=8,
 ):
     """
     Escritura protegida:
     1. evita reemplazar accidentalmente un CSV con datos por uno vacío;
     2. crea backup;
-    3. escribe a un temporal;
-    4. reemplaza el original de forma atómica.
+    3. escribe a un temporal único;
+    4. reemplaza el original de forma atómica;
+    5. reintenta si Windows/OneDrive mantiene un lock transitorio.
+
+    El feedback visual de la operación se maneja en la capa UI mediante
+    run_ui_mutation(). Si todos los reintentos fallan, la excepción sube
+    hasta esa capa y el usuario recibe un estado ERROR visible.
     """
 
-    filepath = Path(filepath)
+    filepath = Path(
+        filepath
+    )
+
+    filepath.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if (
         df.empty
@@ -507,21 +566,47 @@ def safe_write_csv(
         f".{filepath.name}.{uuid.uuid4().hex}.tmp"
     )
 
+    last_error = None
+
     try:
         df.to_csv(
             temp_path,
             index=False,
         )
 
-        temp_path.replace(
-            filepath
-        )
+        for attempt in range(
+            retries
+        ):
+            try:
+                os.replace(
+                    temp_path,
+                    filepath,
+                )
+
+                return
+
+            except PermissionError as exc:
+                last_error = exc
+
+                # Backoff corto: 0.10, 0.20, ... 0.80 s.
+                time.sleep(
+                    0.10
+                    * (
+                        attempt + 1
+                    )
+                )
+
+        if last_error is not None:
+            raise last_error
 
     finally:
         if temp_path.exists():
-            temp_path.unlink(
-                missing_ok=True
-            )
+            try:
+                temp_path.unlink(
+                    missing_ok=True
+                )
+            except OSError:
+                pass
 
 
 def append_row(
@@ -655,6 +740,16 @@ def initialize_files():
     ensure_csv_schema(
         FLAVORS_FILE,
         FLAVOR_COLUMNS,
+    )
+
+    ensure_csv_schema(
+        CAMERA_PRODUCTS_FILE,
+        CAMERA_PRODUCT_COLUMNS,
+    )
+
+    ensure_csv_schema(
+        PRODUCTS_FILE,
+        PRODUCT_COLUMNS,
     )
 
     # Si venimos de current_stock.csv, lo separamos automáticamente.
@@ -1322,13 +1417,47 @@ def bootstrap_flavors():
         "flavor_code"
     ] = normalized_codes
 
-    safe_write_csv(
+    final_flavors = (
         flavor_df[
             FLAVOR_COLUMNS
-        ],
-        FLAVORS_FILE,
-        allow_empty=True,
+        ]
+        .copy()
     )
+
+    existing_flavors = load_csv(
+        FLAVORS_FILE
+    )
+
+    if existing_flavors.empty:
+        flavors_changed = (
+            not final_flavors.empty
+        )
+
+    else:
+        existing_flavors = (
+            existing_flavors
+            .reindex(
+                columns=FLAVOR_COLUMNS
+            )
+        )
+
+        flavors_changed = not (
+            final_flavors
+            .fillna("")
+            .astype(str)
+            .equals(
+                existing_flavors
+                .fillna("")
+                .astype(str)
+            )
+        )
+
+    if flavors_changed:
+        safe_write_csv(
+            final_flavors,
+            FLAVORS_FILE,
+            allow_empty=True,
+        )
 
 
 def load_flavor_catalog(
@@ -1577,6 +1706,545 @@ def calculate_net_weight(
 
 
 # ============================================================
+# CAMERA PRODUCT SNAPSHOTS FOR WEEK
+# ============================================================
+
+PRODUCT_SNAPSHOT_CATEGORIES = [
+    "FAMILIARES",
+    "TENTACIONES",
+    "POSTRES",
+    "TORTAS",
+    "BOMBONES",
+    "PALITOS",
+    "LINEAS_ESPECIALES",
+    "FRIZZIO",
+]
+
+
+def build_camera_products_snapshot():
+    """
+    Snapshot vivo de productos no-granel activos en cámara.
+
+    Persistencia detallada:
+        categoría
+            totals
+                packs
+                boxes
+                units
+
+            products
+                PRODUCT_CODE
+                    producto
+                    packaging_mode
+                    packs
+                    boxes
+                    units
+
+    La UI puede seguir presentando el total por categoría, pero la Week
+    conserva el detalle por producto para futuros cruces con ventas.
+    """
+
+    products = load_camera_products(
+        active_only=True
+    )
+
+    snapshot = {
+        category: {
+            "totals": {
+                "packs": 0,
+                "boxes": 0,
+                "units": 0,
+            },
+            "products": {},
+        }
+        for category
+        in PRODUCT_SNAPSHOT_CATEGORIES
+    }
+
+    if products.empty:
+        return snapshot
+
+    for _, row in products.iterrows():
+
+        category = str(
+            row.get(
+                "categoria",
+                ""
+            )
+        ).strip().upper()
+
+        if not category:
+            continue
+
+        if category not in snapshot:
+            snapshot[
+                category
+            ] = {
+                "totals": {
+                    "packs": 0,
+                    "boxes": 0,
+                    "units": 0,
+                },
+                "products": {},
+            }
+
+        product_code = str(
+            row.get(
+                "product_code",
+                ""
+            )
+        ).strip()
+
+        product_name = str(
+            row.get(
+                "producto",
+                ""
+            )
+        ).strip()
+
+        packaging_mode = str(
+            row.get(
+                "packaging_mode",
+                ""
+            )
+        ).strip()
+
+        if not product_code:
+            # Fallback para filas legacy.
+            product_code = (
+                product_name
+                or str(
+                    row.get(
+                        "product_stock_id",
+                        "UNKNOWN_PRODUCT"
+                    )
+                )
+            )
+
+        packs = pd.to_numeric(
+            row.get(
+                "cantidad_packs",
+                0,
+            ),
+            errors="coerce",
+        )
+
+        boxes = pd.to_numeric(
+            row.get(
+                "total_cajas",
+                row.get(
+                    "cantidad_cajas",
+                    0,
+                ),
+            ),
+            errors="coerce",
+        )
+
+        units = pd.to_numeric(
+            row.get(
+                "total_unidades",
+                0,
+            ),
+            errors="coerce",
+        )
+
+        packs = (
+            int(
+                packs
+            )
+            if pd.notna(
+                packs
+            )
+            else 0
+        )
+
+        boxes = (
+            int(
+                boxes
+            )
+            if pd.notna(
+                boxes
+            )
+            else 0
+        )
+
+        units = (
+            int(
+                units
+            )
+            if pd.notna(
+                units
+            )
+            else 0
+        )
+
+        category_entry = snapshot[
+            category
+        ]
+
+        category_entry[
+            "totals"
+        ][
+            "packs"
+        ] += packs
+
+        category_entry[
+            "totals"
+        ][
+            "boxes"
+        ] += boxes
+
+        category_entry[
+            "totals"
+        ][
+            "units"
+        ] += units
+
+        product_entry = category_entry[
+            "products"
+        ].setdefault(
+            product_code,
+            {
+                "producto":
+                    product_name,
+
+                "packaging_mode":
+                    packaging_mode,
+
+                "packs":
+                    0,
+
+                "boxes":
+                    0,
+
+                "units":
+                    0,
+            },
+        )
+
+        # Keep metadata populated for legacy rows that arrived empty first.
+        if (
+            not product_entry.get(
+                "producto"
+            )
+            and product_name
+        ):
+            product_entry[
+                "producto"
+            ] = product_name
+
+        if (
+            not product_entry.get(
+                "packaging_mode"
+            )
+            and packaging_mode
+        ):
+            product_entry[
+                "packaging_mode"
+            ] = packaging_mode
+
+        product_entry[
+            "packs"
+        ] += packs
+
+        product_entry[
+            "boxes"
+        ] += boxes
+
+        product_entry[
+            "units"
+        ] += units
+
+    return snapshot
+
+
+def products_snapshot_to_json(
+    snapshot,
+):
+    return json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+        sort_keys=True,
+    )
+
+
+def products_snapshot_from_json(
+    value,
+):
+    if value is None:
+        return {}
+
+    try:
+        if pd.isna(
+            value
+        ):
+            return {}
+    except Exception:
+        pass
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return value
+
+    raw = str(
+        value
+    ).strip()
+
+    if not raw or raw.lower() in {
+        "nan",
+        "none",
+        "<na>",
+    }:
+        return {}
+
+    try:
+        parsed = json.loads(
+            raw
+        )
+
+        if isinstance(
+            parsed,
+            dict,
+        ):
+            return parsed
+
+    except Exception:
+        pass
+
+    return {}
+
+
+def product_snapshot_category_totals(
+    category_values,
+):
+    """
+    Devuelve packs/boxes/units tanto para el schema nuevo como para
+    snapshots legacy guardados antes de este refactor.
+    """
+
+    if not isinstance(
+        category_values,
+        dict,
+    ):
+        return {
+            "packs": 0,
+            "boxes": 0,
+            "units": 0,
+        }
+
+    totals = category_values.get(
+        "totals"
+    )
+
+    if isinstance(
+        totals,
+        dict,
+    ):
+        return {
+            "packs":
+                int(
+                    totals.get(
+                        "packs",
+                        0,
+                    )
+                    or 0
+                ),
+
+            "boxes":
+                int(
+                    totals.get(
+                        "boxes",
+                        0,
+                    )
+                    or 0
+                ),
+
+            "units":
+                int(
+                    totals.get(
+                        "units",
+                        0,
+                    )
+                    or 0
+                ),
+        }
+
+    # Legacy:
+    # {
+    #   "FAMILIARES": {"packs": 4, "boxes": 0, "units": 24}
+    # }
+    return {
+        "packs":
+            int(
+                category_values.get(
+                    "packs",
+                    0,
+                )
+                or 0
+            ),
+
+        "boxes":
+            int(
+                category_values.get(
+                    "boxes",
+                    0,
+                )
+                or 0
+            ),
+
+        "units":
+            int(
+                category_values.get(
+                    "units",
+                    0,
+                )
+                or 0
+            ),
+    }
+
+
+def product_snapshot_category_products(
+    category_values,
+):
+    if not isinstance(
+        category_values,
+        dict,
+    ):
+        return {}
+
+    products = category_values.get(
+        "products",
+        {}
+    )
+
+    return (
+        products
+        if isinstance(
+            products,
+            dict,
+        )
+        else {}
+    )
+
+
+def product_snapshot_display_value(
+    category,
+    values,
+):
+    """
+    Muestra solo niveles físicos que aplican a la categoría.
+
+    PACK_UNIDADES:
+        packs + units
+
+    PACK_CAJAS_UNIDADES:
+        packs + boxes + units
+
+    CAJA_UNIDADES:
+        boxes + units
+    """
+
+    values = product_snapshot_category_totals(
+        values
+    )
+
+    packs = values[
+        "packs"
+    ]
+
+    boxes = values[
+        "boxes"
+    ]
+
+    units = values[
+        "units"
+    ]
+
+    category = str(
+        category
+    ).upper()
+
+    if category in {
+        "BOMBONES",
+        "POSTRES",
+        "PALITOS",
+    }:
+        return (
+            f"{packs} packs · "
+            f"{boxes} cajas · "
+            f"{units} unidades"
+        )
+
+    if category in {
+        "FAMILIARES",
+        "TENTACIONES",
+        "TORTAS",
+    }:
+        return (
+            f"{packs} packs · "
+            f"{units} unidades"
+        )
+
+    if category in {
+        "LINEAS_ESPECIALES",
+        "FRIZZIO",
+    }:
+        return (
+            f"{boxes} cajas · "
+            f"{units} unidades"
+        )
+
+    parts = []
+
+    if packs:
+        parts.append(
+            f"{packs} packs"
+        )
+
+    if boxes:
+        parts.append(
+            f"{boxes} cajas"
+        )
+
+    parts.append(
+        f"{units} unidades"
+    )
+
+    return " · ".join(
+        parts
+    )
+
+
+def product_snapshot_units_total(
+    snapshot,
+):
+    if not isinstance(
+        snapshot,
+        dict,
+    ):
+        return 0
+
+    return int(
+        sum(
+            product_snapshot_category_totals(
+                category_values
+            )[
+                "units"
+            ]
+            for category_values
+            in snapshot.values()
+        )
+    )
+
+
+
+# ============================================================
 # WEEKS
 # ============================================================
 
@@ -1725,6 +2393,116 @@ def refresh_all_metadata(
         )
     )
 
+    # --------------------------------------------------------
+    # Product snapshots are owned by the app because they come
+    # from camera_products.csv, not from the granel week service.
+    # Preserve historical start/end snapshots and refresh only
+    # the current snapshot of OPEN weeks.
+    # --------------------------------------------------------
+
+    current_products_snapshot_json = (
+        products_snapshot_to_json(
+            build_camera_products_snapshot()
+        )
+    )
+
+    for snapshot_column in WEEK_PRODUCT_SNAPSHOT_COLUMNS:
+        if snapshot_column not in refreshed_weeks.columns:
+            refreshed_weeks[
+                snapshot_column
+            ] = pd.NA
+
+    if not weeks.empty:
+        existing_snapshots = weeks.copy()
+
+        for snapshot_column in WEEK_PRODUCT_SNAPSHOT_COLUMNS:
+            if snapshot_column not in existing_snapshots.columns:
+                existing_snapshots[
+                    snapshot_column
+                ] = pd.NA
+
+        existing_snapshots = (
+            existing_snapshots[
+                [
+                    "week_id",
+                    *WEEK_PRODUCT_SNAPSHOT_COLUMNS,
+                ]
+            ]
+            .drop_duplicates(
+                subset=[
+                    "week_id"
+                ],
+                keep="last",
+            )
+            .set_index(
+                "week_id"
+            )
+        )
+
+        for idx, refreshed_row in refreshed_weeks.iterrows():
+            week_id = str(
+                refreshed_row.get(
+                    "week_id",
+                    ""
+                )
+            )
+
+            if week_id in existing_snapshots.index:
+                for snapshot_column in [
+                    "start_products_snapshot_json",
+                    "end_products_snapshot_json",
+                ]:
+                    existing_value = existing_snapshots.loc[
+                        week_id,
+                        snapshot_column,
+                    ]
+
+                    if pd.notna(
+                        existing_value
+                    ):
+                        refreshed_weeks.loc[
+                            idx,
+                            snapshot_column,
+                        ] = existing_value
+
+                existing_current = existing_snapshots.loc[
+                    week_id,
+                    "current_products_snapshot_json",
+                ]
+
+                if (
+                    str(
+                        refreshed_row.get(
+                            "status",
+                            ""
+                        )
+                    ).upper()
+                    == "CLOSED"
+                    and pd.notna(
+                        existing_current
+                    )
+                ):
+                    refreshed_weeks.loc[
+                        idx,
+                        "current_products_snapshot_json",
+                    ] = existing_current
+
+    open_mask = (
+        refreshed_weeks[
+            "status"
+        ]
+        .astype(str)
+        .str.upper()
+        .eq(
+            "OPEN"
+        )
+    )
+
+    refreshed_weeks.loc[
+        open_mask,
+        "current_products_snapshot_json",
+    ] = current_products_snapshot_json
+
     weeks_changed = not (
         refreshed_weeks.fillna("")
         .astype(str)
@@ -1795,6 +2573,12 @@ def create_week(
 
     snapshot = current_stock_snapshot(
         stock
+    )
+
+    products_snapshot_json = (
+        products_snapshot_to_json(
+            build_camera_products_snapshot()
+        )
     )
 
     row = {
@@ -1886,6 +2670,15 @@ def create_week(
             "start_camera_snapshot_source":
                 "LIVE_START_SNAPSHOT",
 
+            "start_products_snapshot_json":
+                products_snapshot_json,
+
+            "current_products_snapshot_json":
+                products_snapshot_json,
+
+            "end_products_snapshot_json":
+                pd.NA,
+
             "notes":
                 notes,
         }
@@ -1901,15 +2694,40 @@ def create_week(
 
 def close_week(
     week_id,
+    *,
     end_count_id,
     end_stock_kg,
-    timestamp,
+    timestamp=None,
 ):
+    """
+    Congela una Week DESPUÉS de haber guardado el conteo físico final.
+
+    El conteo final del salón es la fuente de verdad para:
+        - end_count_id
+        - end_stock_kg
+        - end_salon_latas
+        - end_salon_kg
+
+    Cámara se congela con el snapshot vivo del mismo instante.
+    """
+
+    timestamp = (
+        timestamp
+        or now_iso()
+    )
+
     weeks = load_weeks()
 
     mask = (
-        weeks["week_id"]
-        == week_id
+        weeks[
+            "week_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                week_id
+            )
+        )
     )
 
     if not mask.any():
@@ -1933,26 +2751,129 @@ def close_week(
             "La semana ya está cerrada."
         )
 
-    snapshot = current_stock_snapshot(
-        load_current_stock()
+    stock = load_current_stock()
+
+    movements = load_csv(
+        MOVEMENTS_FILE
     )
 
-    weeks.loc[
+    counts = load_csv(
+        COUNTS_FILE
+    )
+
+    # Recalcular todavía como OPEN para congelar toda la actividad
+    # ocurrida hasta el instante del cierre.
+    refreshed_weeks = (
+        refresh_weeks_dataframe(
+            weeks,
+            stock_df=
+                stock,
+
+            movements_df=
+                movements,
+
+            counts_df=
+                counts,
+
+            now_iso=
+                timestamp,
+        )
+    )
+
+    mask = (
+        refreshed_weeks[
+            "week_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                week_id
+            )
+        )
+    )
+
+    idx = refreshed_weeks[
+        mask
+    ].index[0]
+
+    snapshot = current_stock_snapshot(
+        stock
+    )
+
+    products_snapshot_json = (
+        products_snapshot_to_json(
+            build_camera_products_snapshot()
+        )
+    )
+
+    final_count_rows = counts[
+        counts[
+            "count_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                end_count_id
+            )
+        )
+    ].copy()
+
+    if final_count_rows.empty:
+        raise ValueError(
+            "No se encontró el conteo final de la semana."
+        )
+
+    final_count_rows = final_count_rows[
+        final_count_rows[
+            "location"
+        ]
+        .astype(str)
+        .str.upper()
+        .eq(
+            "SALON"
+        )
+    ].copy()
+
+    end_salon_latas = int(
+        len(
+            final_count_rows
+        )
+    )
+
+    end_salon_kg = round(
+        float(
+            pd.to_numeric(
+                final_count_rows[
+                    "peso_neto_kg"
+                ],
+                errors="coerce",
+            )
+            .fillna(0)
+            .sum()
+        ),
+        3,
+    )
+
+    # --------------------------------------------------------
+    # Congelar Week
+    # --------------------------------------------------------
+
+    refreshed_weeks.loc[
         idx,
         "status"
     ] = "CLOSED"
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "closed_at"
     ] = timestamp
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "end_count_id"
     ] = end_count_id
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "end_stock_kg"
     ] = round(
@@ -1962,61 +2883,1495 @@ def close_week(
         3,
     )
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "end_salon_latas"
-    ] = snapshot[
-        "salon_latas"
-    ]
+    ] = end_salon_latas
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "end_salon_kg"
+    ] = end_salon_kg
+
+    refreshed_weeks.loc[
+        idx,
+        "end_camera_latas"
+    ] = int(
+        snapshot[
+            "camera_latas"
+        ]
+    )
+
+    refreshed_weeks.loc[
+        idx,
+        "end_camera_kg"
     ] = round(
         float(
-            end_stock_kg
+            snapshot[
+                "camera_kg"
+            ]
         ),
         3,
     )
 
-    weeks.loc[
+    # Una Week cerrada mantiene current_* como estado final congelado.
+    refreshed_weeks.loc[
         idx,
-        "end_camera_latas"
-    ] = snapshot[
-        "camera_latas"
-    ]
+        "current_salon_latas"
+    ] = end_salon_latas
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
-        "end_camera_kg"
-    ] = snapshot[
-        "camera_kg"
-    ]
+        "current_salon_kg"
+    ] = end_salon_kg
 
-    weeks.loc[
+    refreshed_weeks.loc[
+        idx,
+        "current_camera_latas"
+    ] = int(
+        snapshot[
+            "camera_latas"
+        ]
+    )
+
+    refreshed_weeks.loc[
+        idx,
+        "current_camera_kg"
+    ] = round(
+        float(
+            snapshot[
+                "camera_kg"
+            ]
+        ),
+        3,
+    )
+
+    # Conservamos estos valores para que week_service considere la Week
+    # un snapshot histórico congelado.
+    refreshed_weeks.loc[
         idx,
         "end_salon_snapshot_source"
-    ] = "LIVE_END_COUNT"
+    ] = "LIVE_CLOSE_SNAPSHOT"
 
-    weeks.loc[
+    refreshed_weeks.loc[
         idx,
         "end_camera_snapshot_source"
-    ] = "LIVE_END_SNAPSHOT"
+    ] = "LIVE_CLOSE_SNAPSHOT"
 
-    weeks.loc[
+    refreshed_weeks.loc[
+        idx,
+        "current_products_snapshot_json"
+    ] = products_snapshot_json
+
+    refreshed_weeks.loc[
+        idx,
+        "end_products_snapshot_json"
+    ] = products_snapshot_json
+
+    refreshed_weeks.loc[
         idx,
         "metadata_refreshed_at"
     ] = timestamp
 
     safe_write_csv(
-        weeks[
+        refreshed_weeks[
             WEEK_COLUMNS
         ],
         WEEKS_FILE,
     )
 
-    # Recalcula actividad, consumo físico y demás métricas.
+    return refreshed_weeks.loc[
+        idx
+    ].copy()
+
+
+def close_week_with_final_count(
+    *,
+    week_id,
+    edited_df,
+    notes="",
+):
+    """
+    Cierre semanal con reconciliación física del salón.
+
+    Permite:
+    - editar sabor;
+    - editar estado ABIERTA/CERRADA;
+    - editar peso bruto y tara;
+    - marcar una lata existente para quitarla;
+    - agregar nuevas filas sin stock_id.
+
+    Luego:
+    1. reconcilia el stock vivo;
+    2. registra movimientos de ajuste;
+    3. guarda COUNT CIERRE_SEMANA;
+    4. cierra la Week;
+    5. crea la Week siguiente;
+    6. clona el snapshot como INICIO_SEMANA.
+    """
+
+    timestamp = now_iso()
+
+    open_week = get_open_week()
+
+    if open_week is None:
+        raise ValueError(
+            "No existe una semana abierta."
+        )
+
+    if str(open_week["week_id"]) != str(week_id):
+        raise ValueError(
+            "La semana seleccionada ya no es la semana abierta."
+        )
+
+    stock = load_current_stock()
+
+    salon_active = stock[
+        (
+            stock["location"]
+            .astype(str)
+            .str.upper()
+            .eq("SALON")
+        )
+        &
+        (
+            stock["active"] == True
+        )
+    ].copy()
+
+    existing_ids = set(
+        salon_active["stock_id"]
+        .dropna()
+        .astype(str)
+        .tolist()
+    )
+
+    close_count_id = generate_id(
+        "COUNT"
+    )
+
+    close_operation_id = generate_id(
+        "AJUSTE-CIERRE-SALON"
+    )
+
+    close_rows = []
+
+    total_stock_kg = 0.0
+    abiertas = 0
+    cerradas = 0
+    abiertas_kg = 0.0
+    cerradas_kg = 0.0
+
+    added_ids = []
+    removed_ids = []
+    corrected_ids = []
+
+    processed_existing_ids = set()
+
+    for row_number, row in edited_df.iterrows():
+
+        eliminar = bool(
+            row.get(
+                "eliminar",
+                False,
+            )
+        )
+
+        raw_stock_id = row.get(
+            "stock_id",
+            None,
+        )
+
+        stock_id = (
+            str(raw_stock_id).strip()
+            if pd.notna(raw_stock_id)
+            else ""
+        )
+
+        sabor = normalize_flavor_name(
+            row.get(
+                "sabor",
+                "",
+            )
+        )
+
+        estado = str(
+            row.get(
+                "estado",
+                "",
+            )
+        ).strip().upper()
+
+        if eliminar and not stock_id:
+            continue
+
+        if stock_id:
+            if stock_id not in existing_ids:
+                raise ValueError(
+                    f"Fila {row_number + 1}: "
+                    f"{stock_id} no corresponde a una lata activa del salón."
+                )
+
+            if stock_id in processed_existing_ids:
+                raise ValueError(
+                    f"El stock_id {stock_id} aparece más de una vez."
+                )
+
+            processed_existing_ids.add(
+                stock_id
+            )
+
+            mask = (
+                stock["stock_id"]
+                .astype(str)
+                .eq(stock_id)
+            )
+
+            idx = stock[mask].index[0]
+
+            old_sabor = normalize_flavor_name(
+                stock.loc[idx, "sabor"]
+            )
+
+            old_estado = str(
+                stock.loc[idx, "estado"]
+            ).strip().upper()
+
+            if eliminar:
+                stock.loc[
+                    idx,
+                    "active",
+                ] = False
+
+                stock.loc[
+                    idx,
+                    "updated_at",
+                ] = timestamp
+
+                removed_ids.append(
+                    stock_id
+                )
+
+                append_row(
+                    MOVEMENTS_FILE,
+                    {
+                        "movement_id": generate_id("MOV"),
+                        "operation_id": close_operation_id,
+                        "timestamp": timestamp,
+                        "week_id": week_id,
+                        "movement_type": "AJUSTE_INVENTARIO_SALON_SALIDA",
+                        "from_location": "SALON",
+                        "to_location": "AJUSTE",
+                        "source_stock_id": stock_id,
+                        "target_stock_id": pd.NA,
+                        "sabor": old_sabor,
+                        "cantidad_latas": 1,
+                        "peso_bruto_kg": pd.NA,
+                        "tara_kg": pd.NA,
+                        "peso_neto_kg": pd.NA,
+                        "tara_final_kg": pd.NA,
+                        "residuo_final_kg": pd.NA,
+                        "notes": (
+                            "Removida durante reconciliación del cierre semanal."
+                            + (f" {notes}" if notes else "")
+                        ),
+                    },
+                )
+
+                continue
+
+            if not sabor:
+                raise ValueError(
+                    f"{stock_id}: falta sabor."
+                )
+
+            if estado not in {
+                "ABIERTA",
+                "CERRADA",
+            }:
+                raise ValueError(
+                    f"{stock_id}: estado inválido."
+                )
+
+            peso_bruto = pd.to_numeric(
+                row.get("peso_bruto_kg"),
+                errors="coerce",
+            )
+
+            tara = pd.to_numeric(
+                row.get("tara_kg"),
+                errors="coerce",
+            )
+
+            if pd.isna(peso_bruto):
+                raise ValueError(
+                    f"{stock_id}: falta peso bruto."
+                )
+
+            if pd.isna(tara):
+                raise ValueError(
+                    f"{stock_id}: falta tara."
+                )
+
+            peso_neto = calculate_net_weight(
+                peso_bruto,
+                tara,
+            )
+
+            stock.loc[idx, "sabor"] = sabor
+            stock.loc[idx, "estado"] = estado
+            stock.loc[idx, "peso_actual_bruto_kg"] = round(float(peso_bruto), 3)
+            stock.loc[idx, "tara_actual_kg"] = round(float(tara), 3)
+            stock.loc[idx, "peso_actual_neto_kg"] = peso_neto
+            stock.loc[idx, "updated_at"] = timestamp
+
+            if (
+                sabor != old_sabor
+                or estado != old_estado
+            ):
+                corrected_ids.append(
+                    stock_id
+                )
+
+                append_row(
+                    MOVEMENTS_FILE,
+                    {
+                        "movement_id": generate_id("MOV"),
+                        "operation_id": close_operation_id,
+                        "timestamp": timestamp,
+                        "week_id": week_id,
+                        "movement_type": "AJUSTE_INVENTARIO_SALON_CORRECCION",
+                        "from_location": "SALON",
+                        "to_location": "SALON",
+                        "source_stock_id": stock_id,
+                        "target_stock_id": stock_id,
+                        "sabor": sabor,
+                        "cantidad_latas": 1,
+                        "peso_bruto_kg": round(float(peso_bruto), 3),
+                        "tara_kg": round(float(tara), 3),
+                        "peso_neto_kg": peso_neto,
+                        "tara_final_kg": pd.NA,
+                        "residuo_final_kg": pd.NA,
+                        "notes": (
+                            f"Corrección cierre semanal. "
+                            f"old_sabor={old_sabor}; new_sabor={sabor}; "
+                            f"old_estado={old_estado}; new_estado={estado}"
+                            + (f"; {notes}" if notes else "")
+                        ),
+                    },
+                )
+
+        else:
+            # Fila nueva encontrada físicamente durante el cierre.
+            if eliminar:
+                continue
+
+            # Ignorar fila dinámica totalmente vacía.
+            if not sabor:
+                other_values = [
+                    row.get("estado", None),
+                    row.get("peso_bruto_kg", None),
+                    row.get("tara_kg", None),
+                ]
+
+                if all(
+                    pd.isna(v)
+                    or str(v).strip() == ""
+                    for v in other_values
+                ):
+                    continue
+
+                raise ValueError(
+                    f"Fila {row_number + 1}: falta sabor."
+                )
+
+            if estado not in {
+                "ABIERTA",
+                "CERRADA",
+            }:
+                raise ValueError(
+                    f"Fila nueva {row_number + 1}: "
+                    "seleccioná ABIERTA o CERRADA."
+                )
+
+            peso_bruto = pd.to_numeric(
+                row.get("peso_bruto_kg"),
+                errors="coerce",
+            )
+
+            tara = pd.to_numeric(
+                row.get("tara_kg"),
+                errors="coerce",
+            )
+
+            if pd.isna(peso_bruto):
+                raise ValueError(
+                    f"Fila nueva {row_number + 1}: falta peso bruto."
+                )
+
+            if pd.isna(tara):
+                raise ValueError(
+                    f"Fila nueva {row_number + 1}: falta tara."
+                )
+
+            peso_neto = calculate_net_weight(
+                peso_bruto,
+                tara,
+            )
+
+            new_stock_id = generate_salon_id(
+                stock
+            )
+
+            lata = Lata.create_salon(
+                stock_id=new_stock_id,
+                sabor=sabor,
+                estado=estado,
+                timestamp=timestamp,
+                peso_bruto_kg=peso_bruto,
+                tara_kg=tara,
+                peso_neto_kg=peso_neto,
+                kg_referencia_lata=pd.NA,
+                source_camera_stock_id=None,
+                ingresada_salon_at=timestamp,
+            )
+
+            stock = pd.concat(
+                [
+                    stock,
+                    pd.DataFrame(
+                        [
+                            lata.to_stock_row()
+                        ]
+                    ),
+                ],
+                ignore_index=True,
+            )
+
+            added_ids.append(
+                new_stock_id
+            )
+
+            stock_id = new_stock_id
+
+            append_row(
+                MOVEMENTS_FILE,
+                {
+                    "movement_id": generate_id("MOV"),
+                    "operation_id": close_operation_id,
+                    "timestamp": timestamp,
+                    "week_id": week_id,
+                    "movement_type": "AJUSTE_INVENTARIO_SALON_ENTRADA",
+                    "from_location": "AJUSTE",
+                    "to_location": "SALON",
+                    "source_stock_id": pd.NA,
+                    "target_stock_id": new_stock_id,
+                    "sabor": sabor,
+                    "cantidad_latas": 1,
+                    "peso_bruto_kg": round(float(peso_bruto), 3),
+                    "tara_kg": round(float(tara), 3),
+                    "peso_neto_kg": peso_neto,
+                    "tara_final_kg": pd.NA,
+                    "residuo_final_kg": pd.NA,
+                    "notes": (
+                        "Lata agregada durante reconciliación del cierre semanal."
+                        + (f" {notes}" if notes else "")
+                    ),
+                },
+            )
+
+        close_rows.append(
+            {
+                "count_id": close_count_id,
+                "week_id": week_id,
+                "count_type": "CIERRE_SEMANA",
+                "timestamp": timestamp,
+                "location": "SALON",
+                "stock_id": stock_id,
+                "sabor": sabor,
+                "estado": estado,
+                "peso_bruto_kg": round(float(peso_bruto), 3),
+                "tara_kg": round(float(tara), 3),
+                "peso_neto_kg": peso_neto,
+                "notes": notes,
+            },
+        )
+
+        total_stock_kg += peso_neto
+
+        if estado == "ABIERTA":
+            abiertas += 1
+            abiertas_kg += peso_neto
+        else:
+            cerradas += 1
+            cerradas_kg += peso_neto
+
+    unaccounted = (
+        existing_ids
+        - processed_existing_ids
+    )
+
+    if unaccounted:
+        raise ValueError(
+            "El conteo final no incluye estas latas existentes: "
+            + ", ".join(
+                sorted(unaccounted)[:10]
+            )
+        )
+
+    if not close_rows:
+        raise ValueError(
+            "El conteo final no puede quedar vacío."
+        )
+
+    total_stock_kg = round(
+        total_stock_kg,
+        3,
+    )
+
+    abiertas_kg = round(
+        abiertas_kg,
+        3,
+    )
+
+    cerradas_kg = round(
+        cerradas_kg,
+        3,
+    )
+
+    save_current_stock(
+        stock
+    )
+
+    counts = load_csv(
+        COUNTS_FILE
+    )
+
+    counts = pd.concat(
+        [
+            counts,
+            pd.DataFrame(
+                close_rows
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    safe_write_csv(
+        counts[
+            COUNT_COLUMNS
+        ],
+        COUNTS_FILE,
+        allow_empty=True,
+    )
+
+    closed_week = close_week(
+        week_id=week_id,
+        end_count_id=close_count_id,
+        end_stock_kg=total_stock_kg,
+        timestamp=timestamp,
+    )
+
+    next_start_count_id = generate_id(
+        "COUNT"
+    )
+
+    next_week_id = create_week(
+        start_count_id=next_start_count_id,
+        start_stock_kg=total_stock_kg,
+        timestamp=timestamp,
+        notes=(
+            f"Inicio automático desde cierre de {week_id}. "
+            f"source_count_id={close_count_id}"
+        ),
+    )
+
+    start_rows = []
+
+    for close_row in close_rows:
+        start_row = dict(
+            close_row
+        )
+
+        start_row["count_id"] = next_start_count_id
+        start_row["week_id"] = next_week_id
+        start_row["count_type"] = "INICIO_SEMANA"
+        start_row["timestamp"] = timestamp
+        start_row["notes"] = (
+            f"Inicio automático desde "
+            f"{week_id}/{close_count_id}."
+        )
+
+        start_rows.append(
+            start_row
+        )
+
+    counts = load_csv(
+        COUNTS_FILE
+    )
+
+    counts = pd.concat(
+        [
+            counts,
+            pd.DataFrame(
+                start_rows
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    safe_write_csv(
+        counts[
+            COUNT_COLUMNS
+        ],
+        COUNTS_FILE,
+        allow_empty=True,
+    )
+
     refresh_all_metadata()
+
+    return {
+        "closed_week_id": week_id,
+        "close_count_id": close_count_id,
+        "next_week_id": next_week_id,
+        "next_start_count_id": next_start_count_id,
+        "timestamp": timestamp,
+        "total_latas": len(close_rows),
+        "abiertas": abiertas,
+        "abiertas_kg": abiertas_kg,
+        "cerradas": cerradas,
+        "cerradas_kg": cerradas_kg,
+        "total_stock_kg": total_stock_kg,
+        "added_ids": added_ids,
+        "removed_ids": removed_ids,
+        "corrected_ids": corrected_ids,
+        "end_camera_latas": int(
+            closed_week["end_camera_latas"]
+        ),
+        "end_camera_kg": float(
+            closed_week["end_camera_kg"]
+        ),
+    }
+
+
+# ============================================================
+# PRODUCT CATALOG
+# ============================================================
+
+def load_product_catalog(*,active_only=False):
+    df=load_csv(PRODUCTS_FILE)
+    if df.empty:return pd.DataFrame(columns=PRODUCT_COLUMNS)
+    if "packaging_mode" not in df.columns: df["packaging_mode"]=PACKAGING_PACK_UNITS
+    if "unidades_por_pack" not in df.columns: df["unidades_por_pack"]=df["unidades_por_bulto"] if "unidades_por_bulto" in df.columns else pd.NA
+    if "cajas_por_pack" not in df.columns: df["cajas_por_pack"]=df["cajas_por_bulto"] if "cajas_por_bulto" in df.columns else pd.NA
+    if "unidades_por_caja" not in df.columns: df["unidades_por_caja"]=pd.NA
+    for col in PRODUCT_COLUMNS:
+        if col not in df.columns: df[col]=pd.NA
+    for col in ["cajas_por_pack","unidades_por_pack","unidades_por_caja"]: df[col]=pd.to_numeric(df[col],errors="coerce")
+    df["active"]=df["active"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
+    if active_only: df=df[df["active"]==True].copy()
+    return df[PRODUCT_COLUMNS].copy()
+
+
+def generate_product_code(
+    categoria,
+):
+    categoria = normalize_product_name(
+        categoria
+    )
+
+    category_code = CATEGORY_CODES.get(
+        categoria
+    )
+
+    if not category_code:
+        raise ValueError(
+            f"No hay código configurado para {categoria}."
+        )
+
+    catalog = load_product_catalog(
+        active_only=False
+    )
+
+    existing = (
+        catalog[
+            "product_code"
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+        if (
+            not catalog.empty
+            and "product_code"
+            in catalog.columns
+        )
+        else []
+    )
+
+    return next_sequential_id(
+        existing,
+        f"PROD-{category_code}",
+    )
+
+
+def add_catalog_product(*,categoria,subcategoria,producto,packaging_mode,cajas_por_pack,unidades_por_pack,unidades_por_caja):
+    timestamp=now_iso(); catalog=load_product_catalog(active_only=False)
+    categoria=normalize_product_name(categoria); producto=normalize_product_name(producto); subcategoria_normalizada=normalize_product_name(subcategoria) if subcategoria else None
+    if not catalog.empty:
+        same=catalog[(catalog["categoria"].astype(str)==categoria)&(catalog["producto"].astype(str)==producto)].copy()
+        if subcategoria_normalizada is None: same=same[same["subcategoria"].isna()|same["subcategoria"].astype(str).isin(["","nan","None"])]
+        else: same=same[same["subcategoria"].astype(str)==subcategoria_normalizada]
+        if not same.empty: raise ValueError("Ese producto ya existe en el catálogo para esa categoría/subcategoría.")
+    product=Product.create(product_code=generate_product_code(categoria),categoria=categoria,subcategoria=subcategoria_normalizada,producto=producto,
+        packaging_mode=packaging_mode,cajas_por_pack=cajas_por_pack,unidades_por_pack=unidades_por_pack,unidades_por_caja=unidades_por_caja,timestamp=timestamp)
+    catalog=pd.concat([catalog,pd.DataFrame([product.to_row()])],ignore_index=True)
+    safe_write_csv(catalog[PRODUCT_COLUMNS],PRODUCTS_FILE,allow_empty=True); return product
+
+
+def deactivate_catalog_product(
+    *,
+    product_code,
+):
+    catalog = load_product_catalog(
+        active_only=False
+    )
+
+    matches = catalog[
+        catalog[
+            "product_code"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                product_code
+            )
+        )
+    ]
+
+    if matches.empty:
+        raise ValueError(
+            f"No se encontró {product_code}."
+        )
+
+    idx = matches.index[0]
+
+    product = Product.from_row(
+        catalog.loc[
+            idx
+        ]
+    )
+
+    updates = product.deactivate_updates(
+        timestamp=
+            now_iso(),
+    )
+
+    for field, value in updates.items():
+        catalog.loc[
+            idx,
+            field
+        ] = value
+
+    safe_write_csv(
+        catalog[
+            PRODUCT_COLUMNS
+        ],
+        PRODUCTS_FILE,
+        allow_empty=True,
+    )
+
+    return product
+
+
+def catalog_products_for(
+    *,
+    categoria,
+    subcategoria=None,
+):
+    """
+    Devuelve el catálogo activo ya normalizado al esquema actual.
+
+    Esta función es deliberadamente defensiva porque products.csv puede
+    venir de versiones anteriores del proyecto. Antes de llegar a la UI,
+    garantizamos siempre la existencia de packaging_mode y de todos los
+    campos del esquema nuevo.
+    """
+
+    catalog = load_product_catalog(
+        active_only=True
+    ).copy()
+
+    # Protección extra por si un CSV viejo o una rama anterior devuelve
+    # columnas legacy.
+    if "packaging_mode" not in catalog.columns:
+        catalog[
+            "packaging_mode"
+        ] = PACKAGING_PACK_UNITS
+
+    if "cajas_por_pack" not in catalog.columns:
+        if "cajas_por_bulto" in catalog.columns:
+            catalog[
+                "cajas_por_pack"
+            ] = pd.to_numeric(
+                catalog[
+                    "cajas_por_bulto"
+                ],
+                errors="coerce",
+            )
+        else:
+            catalog[
+                "cajas_por_pack"
+            ] = pd.NA
+
+    if "unidades_por_pack" not in catalog.columns:
+        if "unidades_por_bulto" in catalog.columns:
+            catalog[
+                "unidades_por_pack"
+            ] = pd.to_numeric(
+                catalog[
+                    "unidades_por_bulto"
+                ],
+                errors="coerce",
+            )
+        else:
+            catalog[
+                "unidades_por_pack"
+            ] = pd.NA
+
+    if "unidades_por_caja" not in catalog.columns:
+        catalog[
+            "unidades_por_caja"
+        ] = pd.NA
+
+    for column in PRODUCT_COLUMNS:
+        if column not in catalog.columns:
+            catalog[
+                column
+            ] = pd.NA
+
+    categoria = normalize_product_name(
+        categoria
+    )
+
+    filtered = catalog[
+        catalog[
+            "categoria"
+        ]
+        .astype(str)
+        .eq(
+            categoria
+        )
+    ].copy()
+
+    if subcategoria:
+        subcategoria = normalize_product_name(
+            subcategoria
+        )
+
+        filtered = filtered[
+            filtered[
+                "subcategoria"
+            ]
+            .astype(str)
+            .eq(
+                subcategoria
+            )
+        ].copy()
+
+    return (
+        filtered[
+            PRODUCT_COLUMNS
+        ]
+        .sort_values(
+            "producto"
+        )
+        .reset_index(
+            drop=True
+        )
+    )
+
+
+# ============================================================
+# CAMERA PRODUCTS
+# ============================================================
+
+def normalize_product_name(
+    value,
+):
+    if pd.isna(
+        value
+    ):
+        return ""
+
+    return (
+        str(
+            value
+        )
+        .strip()
+        .upper()
+        .replace(
+            " ",
+            "_",
+        )
+    )
+
+
+def load_camera_products(active_only=False):
+    df=load_csv(CAMERA_PRODUCTS_FILE)
+    if df.empty:return pd.DataFrame(columns=CAMERA_PRODUCT_COLUMNS)
+    if "packaging_mode" not in df.columns: df["packaging_mode"]=PACKAGING_PACK_UNITS
+    if "cantidad_packs" not in df.columns: df["cantidad_packs"]=df["cantidad_bultos"] if "cantidad_bultos" in df.columns else pd.NA
+    if "cantidad_cajas" not in df.columns: df["cantidad_cajas"]=pd.NA
+    if "cajas_por_pack" not in df.columns: df["cajas_por_pack"]=df["cajas_por_bulto"] if "cajas_por_bulto" in df.columns else pd.NA
+    if "unidades_por_pack" not in df.columns: df["unidades_por_pack"]=df["unidades_por_bulto"] if "unidades_por_bulto" in df.columns else pd.NA
+    if "unidades_por_caja" not in df.columns: df["unidades_por_caja"]=pd.NA
+    if "total_cajas" not in df.columns: df["total_cajas"]=pd.NA
+    for col in CAMERA_PRODUCT_COLUMNS:
+        if col not in df.columns: df[col]=pd.NA
+    for col in ["cantidad_packs","cantidad_cajas","cajas_por_pack","unidades_por_pack","unidades_por_caja","total_cajas","total_unidades"]: df[col]=pd.to_numeric(df[col],errors="coerce")
+    df["active"]=df["active"].astype(str).str.strip().str.lower().isin(["true","1","yes"])
+    if active_only: df=df[df["active"]==True].copy()
+    return df[CAMERA_PRODUCT_COLUMNS].copy()
+
+
+def generate_camera_product_id(
+    categoria,
+):
+    categoria = normalize_product_name(
+        categoria
+    )
+
+    code = CATEGORY_CODES.get(
+        categoria
+    )
+
+    if not code:
+        raise ValueError(
+            f"No hay código configurado para la categoría {categoria}."
+        )
+
+    products = load_camera_products(
+        active_only=False
+    )
+
+    existing = (
+        products[
+            "product_stock_id"
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+        if (
+            not products.empty
+            and "product_stock_id"
+            in products.columns
+        )
+        else []
+    )
+
+    return next_sequential_id(
+        existing,
+        f"CAM-{code}",
+    )
+
+
+def add_camera_product(
+    *,
+    product_code,
+    categoria,
+    subcategoria,
+    producto,
+    packaging_mode,
+    cantidad_packs,
+    cantidad_cajas,
+    cajas_por_pack,
+    unidades_por_pack,
+    unidades_por_caja,
+    notes="",
+):
+    """
+    Agrega stock no-granel a cámara con trazabilidad física individual.
+
+    Reglas:
+    - PACK_CAJAS_UNIDADES -> 1 CAM ID por PACK
+    - PACK_UNIDADES       -> 1 CAM ID por PACK
+    - CAJA_UNIDADES       -> 1 CAM ID por CAJA
+
+    Ejemplo:
+        3 packs de FAM_1
+        -> CAM-FAM-000001
+        -> CAM-FAM-000002
+        -> CAM-FAM-000003
+
+    Cada fila guarda cantidad_packs=1 (o cantidad_cajas=1) y su
+    total_unidades individual.
+    """
+
+    timestamp = now_iso()
+
+    if packaging_mode in {
+        PACKAGING_PACK_BOXES_UNITS,
+        PACKAGING_PACK_UNITS,
+    }:
+        physical_count = int(
+            cantidad_packs
+            or 0
+        )
+
+        if physical_count <= 0:
+            raise ValueError(
+                "La cantidad de packs debe ser mayor a cero."
+            )
+
+        per_row_packs = 1
+        per_row_boxes = None
+
+        physical_label = "pack"
+
+    elif packaging_mode == PACKAGING_BOX_UNITS:
+        physical_count = int(
+            cantidad_cajas
+            or 0
+        )
+
+        if physical_count <= 0:
+            raise ValueError(
+                "La cantidad de cajas debe ser mayor a cero."
+            )
+
+        per_row_packs = None
+        per_row_boxes = 1
+
+        physical_label = "caja"
+
+    else:
+        raise ValueError(
+            f"Packaging mode desconocido: {packaging_mode}"
+        )
+
+    products = load_camera_products(
+        active_only=False
+    )
+
+    code = CATEGORY_CODES.get(
+        normalize_product_name(
+            categoria
+        )
+    )
+
+    if not code:
+        raise ValueError(
+            f"No hay código configurado para {categoria}."
+        )
+
+    existing_ids = (
+        products[
+            "product_stock_id"
+        ]
+        .dropna()
+        .astype(str)
+        .tolist()
+        if (
+            not products.empty
+            and "product_stock_id"
+            in products.columns
+        )
+        else []
+    )
+
+    created_products = []
+    created_rows = []
+
+    open_week = get_open_week()
+
+    operation_id = generate_id(
+        "INGRESO-CAMARA-PRODUCTO"
+    )
+
+    for _ in range(
+        physical_count
+    ):
+        product_stock_id = next_sequential_id(
+            existing_ids,
+            f"CAM-{code}",
+        )
+
+        existing_ids.append(
+            product_stock_id
+        )
+
+        product = CameraProduct.create(
+            product_stock_id=
+                product_stock_id,
+
+            product_code=
+                product_code,
+
+            categoria=
+                categoria,
+
+            subcategoria=
+                subcategoria,
+
+            producto=
+                producto,
+
+            packaging_mode=
+                packaging_mode,
+
+            cantidad_packs=
+                per_row_packs,
+
+            cantidad_cajas=
+                per_row_boxes,
+
+            cajas_por_pack=
+                cajas_por_pack,
+
+            unidades_por_pack=
+                unidades_por_pack,
+
+            unidades_por_caja=
+                unidades_por_caja,
+
+            timestamp=
+                timestamp,
+        )
+
+        created_products.append(
+            product
+        )
+
+        created_rows.append(
+            product.to_row()
+        )
+
+        detail = (
+            f"product_code={product.product_code}; "
+            f"categoria={product.categoria}; "
+            f"producto={product.producto}; "
+            f"packaging_mode={product.packaging_mode}; "
+            f"unidad_fisica={physical_label}; "
+            f"total_unidades={product.total_unidades}; "
+        )
+
+        if product.subcategoria:
+            detail += (
+                f"subcategoria={product.subcategoria}; "
+            )
+
+        if product.cantidad_packs is not None:
+            detail += (
+                f"cantidad_packs={product.cantidad_packs}; "
+            )
+
+        if product.cantidad_cajas is not None:
+            detail += (
+                f"cantidad_cajas={product.cantidad_cajas}; "
+            )
+
+        if product.cajas_por_pack is not None:
+            detail += (
+                f"cajas_por_pack={product.cajas_por_pack}; "
+            )
+
+        if product.unidades_por_pack is not None:
+            detail += (
+                f"unidades_por_pack={product.unidades_por_pack}; "
+            )
+
+        if product.unidades_por_caja is not None:
+            detail += (
+                f"unidades_por_caja={product.unidades_por_caja}; "
+            )
+
+        if product.total_cajas is not None:
+            detail += (
+                f"total_cajas={product.total_cajas}; "
+            )
+
+        if notes:
+            detail += notes
+
+        # Un movimiento por unidad física, todos bajo la misma operation_id.
+        append_row(
+            MOVEMENTS_FILE,
+            {
+                "movement_id":
+                    generate_id(
+                        "MOV"
+                    ),
+
+                "operation_id":
+                    operation_id,
+
+                "timestamp":
+                    timestamp,
+
+                "week_id":
+                    (
+                        open_week[
+                            "week_id"
+                        ]
+                        if open_week
+                        is not None
+                        else pd.NA
+                    ),
+
+                "movement_type":
+                    "INGRESO_CAMARA_PRODUCTO",
+
+                "from_location":
+                    "EXTERNO",
+
+                "to_location":
+                    "CAMARA",
+
+                "source_stock_id":
+                    pd.NA,
+
+                "target_stock_id":
+                    product_stock_id,
+
+                "sabor":
+                    pd.NA,
+
+                # Esta columna es legacy del journal.
+                # Para producto no-granel siempre representa 1 unidad física.
+                "cantidad_latas":
+                    1,
+
+                "peso_bruto_kg":
+                    pd.NA,
+
+                "tara_kg":
+                    pd.NA,
+
+                "peso_neto_kg":
+                    pd.NA,
+
+                "tara_final_kg":
+                    pd.NA,
+
+                "residuo_final_kg":
+                    pd.NA,
+
+                "notes":
+                    detail,
+            }
+        )
+
+    products = pd.concat(
+        [
+            products,
+            pd.DataFrame(
+                created_rows
+            ),
+        ],
+        ignore_index=True,
+    )
+
+    safe_write_csv(
+        products[
+            CAMERA_PRODUCT_COLUMNS
+        ],
+        CAMERA_PRODUCTS_FILE,
+        allow_empty=True,
+    )
+
+    return {
+        "operation_id":
+            operation_id,
+
+        "created_products":
+            created_products,
+
+        "created_ids":
+            [
+                product.product_stock_id
+                for product
+                in created_products
+            ],
+
+        "physical_count":
+            physical_count,
+
+        "physical_label":
+            physical_label,
+
+        "total_unidades":
+            int(
+                sum(
+                    product.total_unidades
+                    for product
+                    in created_products
+                )
+            ),
+    }
+
+
+def annul_camera_product(
+    *,
+    product_stock_id,
+    notes="",
+):
+    products = load_camera_products(
+        active_only=False
+    )
+
+    matches = products[
+        products[
+            "product_stock_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                product_stock_id
+            )
+        )
+    ]
+
+    if matches.empty:
+        raise ValueError(
+            f"No se encontró {product_stock_id}."
+        )
+
+    idx = matches.index[0]
+
+    model = CameraProduct.from_row(
+        products.loc[
+            idx
+        ]
+    )
+
+    timestamp = now_iso()
+
+    updates = model.annul_updates(
+        timestamp=
+            timestamp,
+    )
+
+    for field, value in updates.items():
+        products.loc[
+            idx,
+            field
+        ] = value
+
+    safe_write_csv(
+        products[
+            CAMERA_PRODUCT_COLUMNS
+        ],
+        CAMERA_PRODUCTS_FILE,
+        allow_empty=True,
+    )
+
+    open_week = get_open_week()
+
+    operation_id = generate_id(
+        "ANULACION-CAMARA-PRODUCTO"
+    )
+
+    append_row(
+        MOVEMENTS_FILE,
+        {
+            "movement_id":
+                generate_id(
+                    "MOV"
+                ),
+
+            "operation_id":
+                operation_id,
+
+            "timestamp":
+                timestamp,
+
+            "week_id":
+                (
+                    open_week[
+                        "week_id"
+                    ]
+                    if open_week
+                    is not None
+                    else pd.NA
+                ),
+
+            "movement_type":
+                "ANULACION_CAMARA_PRODUCTO",
+
+            "from_location":
+                "CAMARA",
+
+            "to_location":
+                "ANULADA",
+
+            "source_stock_id":
+                product_stock_id,
+
+            "target_stock_id":
+                pd.NA,
+
+            "sabor":
+                pd.NA,
+
+            "cantidad_latas":
+                int(
+                    model.cantidad_packs
+                    if model.cantidad_packs
+                    is not None
+                    else (
+                        model.cantidad_cajas
+                        if model.cantidad_cajas
+                        is not None
+                        else 0
+                    )
+                ),
+
+            "peso_bruto_kg":
+                pd.NA,
+
+            "tara_kg":
+                pd.NA,
+
+            "peso_neto_kg":
+                pd.NA,
+
+            "tara_final_kg":
+                pd.NA,
+
+            "residuo_final_kg":
+                pd.NA,
+
+            "notes":
+                (
+                    f"categoria={model.categoria}; "
+                    + (
+                        f"subcategoria={model.subcategoria}; "
+                        if model.subcategoria
+                        else ""
+                    )
+                    + f"producto={model.producto}; "
+                    f"packaging_mode={model.packaging_mode}; "
+                    + (
+                        f"cantidad_packs={model.cantidad_packs}; "
+                        if model.cantidad_packs is not None
+                        else ""
+                    )
+                    + (
+                        f"cantidad_cajas={model.cantidad_cajas}; "
+                        if model.cantidad_cajas is not None
+                        else ""
+                    )
+                    + f"total_unidades={model.total_unidades}"
+                    + (
+                        f"; {notes}"
+                        if notes
+                        else ""
+                    )
+                ),
+        }
+    )
+
+    return model
 
 
 # ============================================================
@@ -2620,15 +4975,10 @@ def save_salon_count(
         week_id = None
 
     elif count_type == "CIERRE_SEMANA":
-        if open_week is None:
-            raise ValueError(
-                "No existe una semana abierta "
-                "para cerrar."
-            )
-
-        week_id = open_week[
-            "week_id"
-        ]
+        raise ValueError(
+            "El cierre de semana ya no se realiza desde Conteo físico. "
+            "Usá 📅 Semanas → Cerrar semana."
+        )
 
     else:
         week_id = (
@@ -2991,21 +5341,6 @@ def save_salon_count(
         append_row(
             COUNTS_FILE,
             count_row,
-        )
-
-    if count_type == "CIERRE_SEMANA":
-        close_week(
-            week_id=
-                week_id,
-
-            end_count_id=
-                count_id,
-
-            end_stock_kg=
-                total_stock_kg,
-
-            timestamp=
-                timestamp,
         )
 
     return {
@@ -4227,6 +6562,154 @@ refresh_all_metadata()
 
 
 # ============================================================
+# UI OPERATION FEEDBACK
+# ============================================================
+
+def run_ui_mutation(
+    *,
+    running_label,
+    success_label,
+    operation,
+    error_label=None,
+):
+    """
+    Ejecuta una acción que escribe/edita/anula datos mostrando un estado
+    visible durante toda la operación.
+
+    Devuelve:
+        (ok, result)
+
+    - ok=True: la operación terminó sin excepciones.
+    - ok=False: el error ya fue mostrado al usuario.
+
+    Capturamos Exception deliberadamente en la capa UI para que errores de
+    persistencia (PermissionError/OneDrive), validación y escritura no hagan
+    caer toda la pantalla sin feedback.
+    """
+
+    with st.status(
+        f"⏳ {running_label}",
+        expanded=True,
+    ) as status:
+
+        status.write(
+            "Procesando y guardando los cambios. "
+            "No cierres ni recargues la página hasta que termine."
+        )
+
+        try:
+            result = operation()
+
+        except Exception as exc:
+            final_error_label = (
+                error_label
+                or f"No se pudo completar: {running_label}"
+            )
+
+            status.update(
+                label=
+                    f"❌ {final_error_label}",
+
+                state=
+                    "error",
+
+                expanded=
+                    True,
+            )
+
+            st.error(
+                f"{type(exc).__name__}: {exc}"
+            )
+
+            return (
+                False,
+                None,
+            )
+
+        final_success_label = (
+            success_label(
+                result
+            )
+            if callable(
+                success_label
+            )
+            else success_label
+        )
+
+        status.update(
+            label=
+                f"✅ {final_success_label}",
+
+            state=
+                "complete",
+
+            expanded=
+                False,
+        )
+
+        return (
+            True,
+            result,
+        )
+
+
+def save_week_theoretical_consumption(
+    *,
+    week_id,
+    consumo_teorico,
+):
+    weeks_mix = load_weeks()
+
+    week_mask = (
+        weeks_mix[
+            "week_id"
+        ]
+        == week_id
+    )
+
+    if not week_mask.any():
+        raise ValueError(
+            "No se encontró la semana actual."
+        )
+
+    week_idx = weeks_mix[
+        week_mask
+    ].index[0]
+
+    weeks_mix.loc[
+        week_idx,
+        "consumo_teorico_kg"
+    ] = round(
+        float(
+            consumo_teorico
+        ),
+        3,
+    )
+
+    safe_write_csv(
+        weeks_mix[
+            WEEK_COLUMNS
+        ],
+        WEEKS_FILE,
+    )
+
+    refresh_all_metadata()
+
+    return {
+        "week_id":
+            week_id,
+
+        "consumo_teorico_kg":
+            round(
+                float(
+                    consumo_teorico
+                ),
+                3,
+            ),
+    }
+
+
+# ============================================================
 # UI
 # ============================================================
 
@@ -4453,12 +6936,78 @@ with tab_overview:
             ),
         )
 
+        open_products_snapshot = (
+            products_snapshot_from_json(
+                open_week_row.get(
+                    "current_products_snapshot_json"
+                )
+            )
+        )
+
+        if (
+            product_snapshot_units_total(
+                open_products_snapshot
+            )
+            > 0
+        ):
+            st.markdown(
+                "#### 🧊 Productos actuales en cámara"
+            )
+
+            overview_product_rows = []
+
+            for category in PRODUCT_SNAPSHOT_CATEGORIES:
+                values = open_products_snapshot.get(
+                    category,
+                    {},
+                )
+
+                category_totals = (
+                    product_snapshot_category_totals(
+                        values
+                    )
+                )
+
+                if category_totals[
+                    "units"
+                ] <= 0:
+                    continue
+
+                overview_product_rows.append(
+                    {
+                        "Categoría":
+                            category.replace(
+                                "_",
+                                " ",
+                            ).title(),
+
+                        "Stock":
+                            product_snapshot_display_value(
+                                category,
+                                values,
+                            ),
+
+                        "Unidades":
+                            category_totals[
+                                "units"
+                            ],
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    overview_product_rows
+                ),
+                hide_index=True,
+                use_container_width=True,
+            )
+
         st.markdown(
             "#### 🔄 Actividad de la semana"
         )
 
-        a1, a2, a3, a4 = st.columns(
-            4
+        a1, a2, a3 = st.columns(
+            3
         )
 
         a1.metric(
@@ -4467,22 +7016,17 @@ with tab_overview:
         )
 
         a2.metric(
-            "Kg desde cámara",
-            f"{week.camera_to_salon_kg:.3f} kg",
-        )
-
-        a3.metric(
             "Cambios de sabor",
             week.cambios_sabor,
         )
 
-        a4.metric(
+        a3.metric(
             "Latas terminadas",
             week.latas_terminadas,
         )
 
-        a5, a6, a7, a8 = st.columns(
-            4
+        a5, a6, a7 = st.columns(
+            3
         )
 
         a5.metric(
@@ -4491,16 +7035,11 @@ with tab_overview:
         )
 
         a6.metric(
-            "Recambios",
-            week.recambios,
-        )
-
-        a7.metric(
             "Latas con tara final",
             week.latas_con_tara_final,
         )
 
-        a8.metric(
+        a7.metric(
             "Tara final acumulada",
             f"{week.tara_final_total_kg:.3f} kg",
         )
@@ -4510,18 +7049,1044 @@ with tab_overview:
         )
 
         a9.metric(
-            "Residuo estimado de helado",
-            f"{week.residuo_estimado_kg:.3f} kg",
-        )
-
-        a10.metric(
             "Ingresos a cámara",
             f"{week.ingreso_camera_latas} latas",
         )
 
-        st.metric(
+        a10.metric(
             "Kg ingresados a cámara",
             f"{week.ingreso_camera_kg:.3f} kg",
+        )
+
+        # --------------------------------------------------------
+        # Promedios operativos de la semana
+        # --------------------------------------------------------
+        # Se calculan desde stock_movements.csv para que reflejen
+        # exactamente los eventos ocurridos dentro de esta Week:
+        #
+        # - Promedio tara final:
+        #   tara_final_kg de movimientos LATA_AGOTADA.
+        #
+        # - Promedio bruto salida cámara:
+        #   peso_bruto_kg de movimientos CAMARA_A_SALON.
+        #
+        # - Promedio neto lata semanal:
+        #   promedio bruto salida cámara - promedio tara final.
+        #
+        # Este último es una estimación semanal del contenido neto medio
+        # por lata usando dos promedios observados de la misma Week.
+        # --------------------------------------------------------
+
+        week_movements = load_csv(
+            MOVEMENTS_FILE
+        )
+
+        avg_tara_final_kg = None
+        avg_camera_exit_gross_kg = None
+        total_camera_exit_gross_kg = None
+        estimated_camera_exit_net_kg = None
+        avg_weekly_net_can_kg = None
+
+        nominal_camera_exit_total_kg = None
+        nominal_camera_exit_deficit_kg = None
+        nominal_camera_exit_deficit_per_can_kg = None
+        nominal_camera_exit_deficit_pct = None
+
+        nominal_analysis_df = pd.DataFrame()
+        nominal_initial_closed_count = 0
+        nominal_camera_count = 0
+        nominal_above_count = 0
+        nominal_in_range_count = 0
+        nominal_below_count = 0
+        nominal_deficit_total_kg = 0.0
+        nominal_excess_total_kg = 0.0
+        nominal_balance_total_kg = 0.0
+        nominal_avg_deviation_kg = None
+
+        if (
+            not week_movements.empty
+            and "week_id" in week_movements.columns
+        ):
+            week_movements = week_movements[
+                week_movements[
+                    "week_id"
+                ]
+                .astype(str)
+                .eq(
+                    str(
+                        week.week_id
+                    )
+                )
+            ].copy()
+
+            movement_types = (
+                week_movements[
+                    "movement_type"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.upper()
+            )
+
+            exhausted = week_movements[
+                movement_types.eq(
+                    "LATA_AGOTADA"
+                )
+            ].copy()
+
+            if (
+                not exhausted.empty
+                and "tara_final_kg"
+                in exhausted.columns
+            ):
+                tara_values = pd.to_numeric(
+                    exhausted[
+                        "tara_final_kg"
+                    ],
+                    errors="coerce",
+                ).dropna()
+
+                if not tara_values.empty:
+                    avg_tara_final_kg = float(
+                        tara_values.mean()
+                    )
+
+            camera_exits = week_movements[
+                movement_types.eq(
+                    "CAMARA_A_SALON"
+                )
+            ].copy()
+
+            if (
+                not camera_exits.empty
+                and "peso_bruto_kg"
+                in camera_exits.columns
+            ):
+                gross_values = pd.to_numeric(
+                    camera_exits[
+                        "peso_bruto_kg"
+                    ],
+                    errors="coerce",
+                ).dropna()
+
+                if not gross_values.empty:
+                    avg_camera_exit_gross_kg = float(
+                        gross_values.mean()
+                    )
+                    total_camera_exit_gross_kg = float(
+                        gross_values.sum()
+                    )
+
+            if (
+                avg_tara_final_kg is not None
+                and avg_camera_exit_gross_kg is not None
+            ):
+                avg_weekly_net_can_kg = max(
+                    0.0,
+                    avg_camera_exit_gross_kg
+                    - avg_tara_final_kg,
+                )
+
+            if (
+                avg_tara_final_kg is not None
+                and total_camera_exit_gross_kg is not None
+            ):
+                camera_exit_count = int(len(camera_exits))
+                estimated_camera_exit_net_kg = max(
+                    0.0,
+                    total_camera_exit_gross_kg
+                    - (camera_exit_count * avg_tara_final_kg),
+                )
+
+                nominal_camera_exit_total_kg = (
+                    camera_exit_count
+                    * GRIDO_NOMINAL_NET_KG
+                )
+
+                nominal_camera_exit_deficit_kg = (
+                    estimated_camera_exit_net_kg
+                    - nominal_camera_exit_total_kg
+                )
+
+                nominal_camera_exit_deficit_per_can_kg = (
+                    nominal_camera_exit_deficit_kg
+                    / camera_exit_count
+                    if camera_exit_count > 0
+                    else None
+                )
+
+                nominal_camera_exit_deficit_pct = (
+                    nominal_camera_exit_deficit_kg
+                    / nominal_camera_exit_total_kg
+                    * 100.0
+                    if nominal_camera_exit_total_kg > 0
+                    else None
+                )
+
+                # --------------------------------------------------
+                # Universo para cumplimiento nominal:
+                #
+                # A) latas que ya estaban CERRADAS al inicio de la Week
+                #    (inventory_counts.csv / start_count_id)
+                #
+                # B) latas que ingresaron desde cámara durante la Week
+                #    (CAMARA_A_SALON)
+                #
+                # Se unifican por ID físico para no contar dos veces.
+                # --------------------------------------------------
+
+                nominal_sources = []
+
+                # A) CERRADAS AL INICIO
+                week_counts = load_csv(
+                    COUNTS_FILE
+                )
+
+                if (
+                    not week_counts.empty
+                    and "count_id" in week_counts.columns
+                ):
+                    start_count_id = str(
+                        getattr(
+                            week,
+                            "start_count_id",
+                            "",
+                        )
+                        or ""
+                    ).strip()
+
+                    initial_closed = week_counts[
+                        week_counts[
+                            "count_id"
+                        ]
+                        .astype(str)
+                        .eq(
+                            start_count_id
+                        )
+                    ].copy()
+
+                    if "count_type" in initial_closed.columns:
+                        initial_closed = initial_closed[
+                            initial_closed[
+                                "count_type"
+                            ]
+                            .fillna("")
+                            .astype(str)
+                            .str.upper()
+                            .eq(
+                                "INICIO_SEMANA"
+                            )
+                        ].copy()
+
+                    if "estado" in initial_closed.columns:
+                        initial_closed = initial_closed[
+                            initial_closed[
+                                "estado"
+                            ]
+                            .fillna("")
+                            .astype(str)
+                            .str.upper()
+                            .eq(
+                                "CERRADA"
+                            )
+                        ].copy()
+
+                    if (
+                        not initial_closed.empty
+                        and "peso_bruto_kg"
+                        in initial_closed.columns
+                    ):
+                        initial_closed[
+                            "peso_bruto_kg"
+                        ] = pd.to_numeric(
+                            initial_closed[
+                                "peso_bruto_kg"
+                            ],
+                            errors="coerce",
+                        )
+
+                        initial_closed = initial_closed[
+                            initial_closed[
+                                "peso_bruto_kg"
+                            ].notna()
+                        ].copy()
+
+                        initial_nominal = pd.DataFrame(
+                            {
+                                "analysis_stock_id":
+                                    initial_closed.get(
+                                        "stock_id",
+                                        pd.Series(
+                                            index=initial_closed.index,
+                                            dtype=object,
+                                        ),
+                                    ),
+
+                                "sabor":
+                                    initial_closed.get(
+                                        "sabor",
+                                        "",
+                                    ),
+
+                                "peso_bruto_kg":
+                                    initial_closed[
+                                        "peso_bruto_kg"
+                                    ],
+
+                                "origen":
+                                    "CERRADA_INICIO",
+                            }
+                        )
+
+                        nominal_sources.append(
+                            initial_nominal
+                        )
+
+                # B) INGRESADAS DESDE CÁMARA
+                camera_nominal = camera_exits[
+                    [
+                        col
+                        for col in [
+                            "target_stock_id",
+                            "source_stock_id",
+                            "sabor",
+                            "peso_bruto_kg",
+                        ]
+                        if col in camera_exits.columns
+                    ]
+                ].copy()
+
+                if (
+                    not camera_nominal.empty
+                    and "peso_bruto_kg"
+                    in camera_nominal.columns
+                ):
+                    camera_nominal[
+                        "peso_bruto_kg"
+                    ] = pd.to_numeric(
+                        camera_nominal[
+                            "peso_bruto_kg"
+                        ],
+                        errors="coerce",
+                    )
+
+                    camera_nominal = camera_nominal[
+                        camera_nominal[
+                            "peso_bruto_kg"
+                        ].notna()
+                    ].copy()
+
+                    if "target_stock_id" in camera_nominal.columns:
+                        camera_nominal[
+                            "analysis_stock_id"
+                        ] = camera_nominal[
+                            "target_stock_id"
+                        ]
+
+                        if "source_stock_id" in camera_nominal.columns:
+                            missing_target = (
+                                camera_nominal[
+                                    "analysis_stock_id"
+                                ].isna()
+                                |
+                                camera_nominal[
+                                    "analysis_stock_id"
+                                ]
+                                .astype(str)
+                                .str.strip()
+                                .isin(
+                                    [
+                                        "",
+                                        "nan",
+                                        "None",
+                                        "<NA>",
+                                    ]
+                                )
+                            )
+
+                            camera_nominal.loc[
+                                missing_target,
+                                "analysis_stock_id",
+                            ] = camera_nominal.loc[
+                                missing_target,
+                                "source_stock_id",
+                            ]
+
+                    elif "source_stock_id" in camera_nominal.columns:
+                        camera_nominal[
+                            "analysis_stock_id"
+                        ] = camera_nominal[
+                            "source_stock_id"
+                        ]
+
+                    else:
+                        camera_nominal[
+                            "analysis_stock_id"
+                        ] = [
+                            f"CAMERA_EXIT_{i}"
+                            for i in range(
+                                len(
+                                    camera_nominal
+                                )
+                            )
+                        ]
+
+                    camera_nominal[
+                        "origen"
+                    ] = "DESDE_CAMARA"
+
+                    nominal_sources.append(
+                        camera_nominal[
+                            [
+                                "analysis_stock_id",
+                                "sabor",
+                                "peso_bruto_kg",
+                                "origen",
+                            ]
+                        ]
+                    )
+
+                if nominal_sources:
+                    nominal_analysis_df = pd.concat(
+                        nominal_sources,
+                        ignore_index=True,
+                    )
+
+                    nominal_analysis_df[
+                        "analysis_stock_id"
+                    ] = (
+                        nominal_analysis_df[
+                            "analysis_stock_id"
+                        ]
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                    )
+
+                    # Si por algún dato legacy apareciera el mismo ID en
+                    # ambos orígenes, cuenta una sola lata física.
+                    with_id = nominal_analysis_df[
+                        nominal_analysis_df[
+                            "analysis_stock_id"
+                        ].ne("")
+                    ].drop_duplicates(
+                        subset=[
+                            "analysis_stock_id"
+                        ],
+                        keep="first",
+                    )
+
+                    without_id = nominal_analysis_df[
+                        nominal_analysis_df[
+                            "analysis_stock_id"
+                        ].eq("")
+                    ]
+
+                    nominal_analysis_df = pd.concat(
+                        [
+                            with_id,
+                            without_id,
+                        ],
+                        ignore_index=True,
+                    )
+
+                if not nominal_analysis_df.empty:
+                    nominal_initial_closed_count = int(
+                        (
+                            nominal_analysis_df[
+                                "origen"
+                            ]
+                            == "CERRADA_INICIO"
+                        ).sum()
+                    )
+
+                    nominal_camera_count = int(
+                        (
+                            nominal_analysis_df[
+                                "origen"
+                            ]
+                            == "DESDE_CAMARA"
+                        ).sum()
+                    )
+
+                    nominal_analysis_df[
+                        "tara_promedio_week_kg"
+                    ] = avg_tara_final_kg
+
+                    nominal_analysis_df[
+                        "neto_estimado_kg"
+                    ] = (
+                        nominal_analysis_df[
+                            "peso_bruto_kg"
+                        ]
+                        - avg_tara_final_kg
+                    )
+
+                    nominal_analysis_df[
+                        "objetivo_neto_kg"
+                    ] = GRIDO_NOMINAL_NET_KG
+
+                    nominal_analysis_df[
+                        "desvio_vs_nominal_kg"
+                    ] = (
+                        nominal_analysis_df[
+                            "neto_estimado_kg"
+                        ]
+                        - GRIDO_NOMINAL_NET_KG
+                    )
+
+                    nominal_analysis_df[
+                        "desvio_vs_nominal_pct"
+                    ] = (
+                        nominal_analysis_df[
+                            "desvio_vs_nominal_kg"
+                        ]
+                        / GRIDO_NOMINAL_NET_KG
+                        * 100.0
+                    )
+
+                    def classify_nominal_deviation(value):
+                        if value > GRIDO_NOMINAL_TOLERANCE_KG:
+                            return "EXCEDENTE"
+                        if value < -GRIDO_NOMINAL_TOLERANCE_KG:
+                            return "DEFICIT"
+                        return "EN_RANGO"
+
+                    nominal_analysis_df[
+                        "estado_nominal"
+                    ] = nominal_analysis_df[
+                        "desvio_vs_nominal_kg"
+                    ].apply(
+                        classify_nominal_deviation
+                    )
+
+                    nominal_above_count = int(
+                        (
+                            nominal_analysis_df[
+                                "estado_nominal"
+                            ]
+                            == "EXCEDENTE"
+                        ).sum()
+                    )
+
+                    nominal_in_range_count = int(
+                        (
+                            nominal_analysis_df[
+                                "estado_nominal"
+                            ]
+                            == "EN_RANGO"
+                        ).sum()
+                    )
+
+                    nominal_below_count = int(
+                        (
+                            nominal_analysis_df[
+                                "estado_nominal"
+                            ]
+                            == "DEFICIT"
+                        ).sum()
+                    )
+
+                    deficits = nominal_analysis_df[
+                        nominal_analysis_df[
+                            "desvio_vs_nominal_kg"
+                        ] < 0
+                    ][
+                        "desvio_vs_nominal_kg"
+                    ]
+
+                    excesses = nominal_analysis_df[
+                        nominal_analysis_df[
+                            "desvio_vs_nominal_kg"
+                        ] > 0
+                    ][
+                        "desvio_vs_nominal_kg"
+                    ]
+
+                    nominal_deficit_total_kg = float(
+                        -deficits.sum()
+                    ) if not deficits.empty else 0.0
+
+                    nominal_excess_total_kg = float(
+                        excesses.sum()
+                    ) if not excesses.empty else 0.0
+
+                    nominal_balance_total_kg = float(
+                        nominal_analysis_df[
+                            "desvio_vs_nominal_kg"
+                        ].sum()
+                    )
+
+                    nominal_avg_deviation_kg = float(
+                        nominal_analysis_df[
+                            "desvio_vs_nominal_kg"
+                        ].mean()
+                    )
+
+
+        st.markdown(
+            "#### ⚖️ Análisis de merma de la semana"
+        )
+
+        st.caption(
+            "Primero analizamos cuánto pesa realmente una lata durante "
+            "esta semana. Para eso cruzamos las salidas de Cámara → Salón "
+            "con las taras registradas al agotar latas."
+        )
+
+        st.markdown(
+            "##### 🪣 Peso de las latas ingresadas al salón"
+        )
+
+        m1, m2, m3 = st.columns(3)
+
+        m1.metric(
+            "Kg brutos desde cámara",
+            f"{total_camera_exit_gross_kg:.3f} kg"
+            if total_camera_exit_gross_kg is not None else "-",
+            help=(
+                "Suma de peso_bruto_kg de todos los movimientos "
+                "CAMARA_A_SALON de esta Week. Es peso real medido, "
+                "sin descontar tara."
+            ),
+        )
+
+        m2.metric(
+            "Prom. tara final semanal",
+            f"{avg_tara_final_kg:.3f} kg"
+            if avg_tara_final_kg is not None else "-",
+            help=(
+                "Promedio de tara_final_kg de todas las latas "
+                "LATA_AGOTADA de esta Week."
+            ),
+        )
+
+        m3.metric(
+            "Kg netos estimados desde cámara",
+            f"{estimated_camera_exit_net_kg:.3f} kg"
+            if estimated_camera_exit_net_kg is not None else "-",
+            help=(
+                "Kg brutos desde cámara - (cantidad de latas trasladadas "
+                "× promedio de tara final semanal)."
+            ),
+        )
+
+        m4, m5, m6 = st.columns(3)
+
+        m4.metric(
+            "Neto nominal esperado",
+            (
+                f"{nominal_camera_exit_total_kg:.3f} kg"
+                if nominal_camera_exit_total_kg is not None
+                else "-"
+            ),
+            help=(
+                "Cantidad de latas CAMARA_A_SALON de esta Week × "
+                "7.800 kg netos nominales por lata."
+            ),
+        )
+
+        m5.metric(
+            "Déficit vs nominal",
+            (
+                f"{nominal_camera_exit_deficit_kg:+.3f} kg"
+                if nominal_camera_exit_deficit_kg is not None
+                else "-"
+            ),
+            help=(
+                "Kg netos estimados desde cámara - Neto nominal esperado. "
+                "Un valor negativo indica faltante respecto del nominal."
+            ),
+        )
+
+        m6.metric(
+            "Déficit prom. por lata",
+            (
+                f"{nominal_camera_exit_deficit_per_can_kg:+.3f} kg"
+                if nominal_camera_exit_deficit_per_can_kg is not None
+                else "-"
+            ),
+            help=(
+                "Déficit vs nominal dividido por la cantidad de latas "
+                "ingresadas desde cámara durante la Week."
+            ),
+        )
+
+        m7, m8, m9 = st.columns(3)
+
+        m7.metric(
+            "Prom. bruto por lata",
+            f"{avg_camera_exit_gross_kg:.3f} kg"
+            if avg_camera_exit_gross_kg is not None else "-",
+            help=(
+                "Kg brutos totales / cantidad de movimientos "
+                "CAMARA_A_SALON."
+            ),
+        )
+
+        m8.metric(
+            "Neto promedio estimado por lata",
+            f"{avg_weekly_net_can_kg:.3f} kg"
+            if avg_weekly_net_can_kg is not None else "-",
+            help=(
+                "Promedio bruto por lata - promedio de tara final semanal."
+            ),
+        )
+
+        m9.metric(
+            "Déficit %",
+            (
+                f"{nominal_camera_exit_deficit_pct:+.2f}%"
+                if nominal_camera_exit_deficit_pct is not None
+                else "-"
+            ),
+            help=(
+                "Déficit vs nominal / Neto nominal esperado × 100. "
+                "Negativo indica faltante relativo frente a 7.800 kg por lata."
+            ),
+        )
+
+        st.markdown(
+            "##### 🔎 Calidad de pesajes Cámara → Salón"
+        )
+
+        camera_moves_total = int(len(camera_exits))
+
+        if (
+            not camera_exits.empty
+            and "peso_bruto_kg" in camera_exits.columns
+        ):
+            camera_weight_debug = pd.to_numeric(
+                camera_exits["peso_bruto_kg"],
+                errors="coerce",
+            )
+
+            camera_moves_valid_weight = int(
+                camera_weight_debug.notna().sum()
+            )
+
+            camera_moves_invalid_weight = int(
+                camera_weight_debug.isna().sum()
+            )
+        else:
+            camera_moves_valid_weight = 0
+            camera_moves_invalid_weight = camera_moves_total
+
+        d1, d2, d3 = st.columns(3)
+
+        d1.metric(
+            "Movimientos totales",
+            camera_moves_total,
+            help=(
+                "Cantidad total de movimientos CAMARA_A_SALON "
+                "detectados en esta Week."
+            ),
+        )
+
+        d2.metric(
+            "Con peso bruto válido",
+            camera_moves_valid_weight,
+            help=(
+                "Movimientos CAMARA_A_SALON cuyo peso_bruto_kg "
+                "puede convertirse correctamente a número."
+            ),
+        )
+
+        d3.metric(
+            "Sin peso bruto válido",
+            camera_moves_invalid_weight,
+            help=(
+                "Movimientos CAMARA_A_SALON sin peso_bruto_kg "
+                "o con un valor que no puede interpretarse como número. "
+                "Estas filas no pueden entrar al análisis nominal."
+            ),
+        )
+
+        st.markdown(
+            "##### 📦 Cumplimiento de peso nominal Grido"
+        )
+
+        st.caption(
+            "Analizamos todas las latas con peso bruto confiable de la Week: "
+            "las que ya estaban CERRADAS en el conteo inicial y las que "
+            "ingresaron desde Cámara → Salón durante la semana. Para cada "
+            "una estimamos el neto como peso bruto real menos la tara "
+            "promedio final observada en esta misma Week y lo comparamos "
+            "contra 7.800 kg."
+        )
+
+        n1, n2, n3, n4, n5 = st.columns(5)
+
+        n1.metric(
+            "Referencia neta",
+            f"{GRIDO_NOMINAL_NET_KG:.3f} kg",
+            help=(
+                "Peso neto nominal esperado por lata según la referencia "
+                "operativa usada en el sistema."
+            ),
+        )
+
+        n2.metric(
+            "Latas analizadas",
+            len(nominal_analysis_df),
+            help=(
+                "Total de latas físicas únicas analizadas: cerradas al "
+                "inicio de la Week + ingresadas desde cámara durante ella."
+            ),
+        )
+
+        n3.metric(
+            "Cerradas al inicio",
+            nominal_initial_closed_count,
+            help=(
+                "Latas con estado CERRADA en el INICIO_SEMANA asociado "
+                "al start_count_id de esta Week."
+            ),
+        )
+
+        n4.metric(
+            "Desde cámara",
+            nominal_camera_count,
+            help=(
+                "Latas con movimiento CAMARA_A_SALON y peso_bruto_kg "
+                "válido durante esta Week."
+            ),
+        )
+
+        n5.metric(
+            "Déficit claro",
+            nominal_below_count,
+            help=(
+                "Latas cuyo neto estimado quedó más de 50 g por debajo "
+                "de 7.800 kg."
+            ),
+        )
+
+        n6a, n6b = st.columns(2)
+
+        n6a.metric(
+            "En rango o mejor",
+            nominal_above_count + nominal_in_range_count,
+            help=(
+                "Latas cuyo neto estimado quedó dentro de ±50 g del nominal "
+                "o por encima de ese rango."
+            ),
+        )
+
+        n6b.metric(
+            "% en rango o mejor",
+            (
+                f"{((nominal_above_count + nominal_in_range_count) / len(nominal_analysis_df) * 100):.1f}%"
+                if len(nominal_analysis_df) > 0
+                else "-"
+            ),
+            help=(
+                "Porcentaje de todas las latas analizadas que quedaron "
+                "dentro de la tolerancia o por encima del nominal."
+            ),
+        )
+
+        n7, n8, n9, n10 = st.columns(4)
+
+        n7.metric(
+            "Desvío promedio vs 7.800",
+            (
+                f"{nominal_avg_deviation_kg:+.3f} kg"
+                if nominal_avg_deviation_kg is not None
+                else "-"
+            ),
+            help=(
+                "Promedio de (neto estimado por lata - 7.800 kg). "
+                "Negativo indica faltante promedio de origen."
+            ),
+        )
+
+        n8.metric(
+            "Déficit total",
+            f"{nominal_deficit_total_kg:.3f} kg",
+            help=(
+                "Suma absoluta de todos los desvíos negativos respecto "
+                "de 7.800 kg."
+            ),
+        )
+
+        n9.metric(
+            "Excedente total",
+            f"{nominal_excess_total_kg:.3f} kg",
+            help=(
+                "Suma de todos los desvíos positivos respecto de 7.800 kg."
+            ),
+        )
+
+        n10.metric(
+            "Balance neto vs nominal",
+            f"{nominal_balance_total_kg:+.3f} kg",
+            help=(
+                "Excedentes menos déficits. Negativo significa que, en "
+                "conjunto, las latas analizadas trajeron menos helado que "
+                "la referencia nominal esperada."
+            ),
+        )
+
+        if not nominal_analysis_df.empty:
+            with st.expander(
+                "🔎 Ver lata por lata"
+            ):
+                nominal_detail = nominal_analysis_df.copy()
+
+                nominal_detail[
+                    "Lata"
+                ] = nominal_detail[
+                    "analysis_stock_id"
+                ]
+
+                nominal_detail[
+                    "Origen"
+                ] = nominal_detail[
+                    "origen"
+                ].map(
+                    {
+                        "CERRADA_INICIO":
+                            "Cerrada al inicio",
+
+                        "DESDE_CAMARA":
+                            "Desde cámara",
+                    }
+                ).fillna(
+                    nominal_detail[
+                        "origen"
+                    ]
+                )
+
+                if "sabor" not in nominal_detail.columns:
+                    nominal_detail[
+                        "sabor"
+                    ] = ""
+
+                nominal_detail = nominal_detail.rename(
+                    columns={
+                        "sabor": "Sabor",
+                        "peso_bruto_kg": "Bruto",
+                        "tara_promedio_week_kg": "Tara prom.",
+                        "neto_estimado_kg": "Neto estimado",
+                        "desvio_vs_nominal_kg": "Vs 7.800",
+                        "desvio_vs_nominal_pct": "Desvío %",
+                        "estado_nominal": "Estado",
+                    }
+                )
+
+                st.dataframe(
+                    nominal_detail[
+                        [
+                            "Lata",
+                            "Sabor",
+                            "Origen",
+                            "Bruto",
+                            "Tara prom.",
+                            "Neto estimado",
+                            "Vs 7.800",
+                            "Desvío %",
+                            "Estado",
+                        ]
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Bruto": st.column_config.NumberColumn(
+                            format="%.3f kg"
+                        ),
+                        "Tara prom.": st.column_config.NumberColumn(
+                            format="%.3f kg"
+                        ),
+                        "Neto estimado": st.column_config.NumberColumn(
+                            format="%.3f kg"
+                        ),
+                        "Vs 7.800": st.column_config.NumberColumn(
+                            format="%+.3f kg"
+                        ),
+                        "Desvío %": st.column_config.NumberColumn(
+                            format="%+.2f%%"
+                        ),
+                    },
+                )
+
+        st.markdown(
+            "##### 🧮 Balance de merma"
+        )
+
+        st.caption(
+            "Después comparamos lo que físicamente salió del inventario "
+            "con lo que, según las ventas, debería haberse consumido. "
+            "La diferencia entre ambos es la merma estimada."
+        )
+
+        b1, b2, b3 = st.columns(
+            3
+        )
+
+        consumo_fisico_kg = None
+        consumo_teorico_kg = None
+        merma_kg = None
+        merma_pct = None
+        merma_latas_equivalentes = None
+
+        b1.metric(
+            "Consumo físico",
+            "Pendiente cierre",
+            help=(
+                "QUÉ ANALIZA: cuántos kg desaparecieron físicamente del "
+                "stock de salón durante la Week. DATOS USADOS: kg del "
+                "conteo inicial del salón + kg netos ingresados desde "
+                "cámara - kg del conteo físico final. "
+                "CÁLCULO: inicial + entradas - cierre."
+            ),
+        )
+
+        b2.metric(
+            "Consumo teórico ventas",
+            "Pendiente Mix",
+            help=(
+                "QUÉ ANALIZA: cuántos kg de helado deberían haberse "
+                "consumido según lo vendido. DATO USADO: Mix de Ventas "
+                "de la misma Week, convertido a consumo teórico de "
+                "helado según cada tipo de venta."
+            ),
+        )
+
+        b3.metric(
+            "Merma",
+            "-",
+            help=(
+                "QUÉ ANALIZA: la diferencia entre el helado que realmente "
+                "desapareció del inventario y el que las ventas justifican. "
+                "DATOS USADOS: Consumo físico y Consumo teórico. "
+                "CÁLCULO: consumo físico - consumo teórico."
+            ),
+        )
+
+        c1, c2 = st.columns(
+            2
+        )
+
+        c1.metric(
+            "Merma %",
+            "-",
+            help=(
+                "QUÉ ANALIZA: qué porcentaje del consumo teórico representa "
+                "la diferencia encontrada. DATOS USADOS: Merma en kg y "
+                "Consumo teórico de ventas. "
+                "CÁLCULO: merma kg / consumo teórico kg × 100."
+            ),
+        )
+
+        c2.metric(
+            "Latas equivalentes de merma",
+            "-",
+            help=(
+                "QUÉ ANALIZA: a cuántas latas promedio equivale la merma "
+                "de la Week. DATOS USADOS: Merma en kg y Neto promedio "
+                "estimado por lata. CÁLCULO: merma kg / neto promedio."
+            ),
         )
 
         st.markdown(
@@ -4764,45 +8329,30 @@ with tab_overview:
                     "💾 Asociar consumo teórico a semana actual",
                     key="save_week_theoretical_consumption",
                 ):
-                    weeks_mix = load_weeks()
+                    ok, _ = run_ui_mutation(
+                        running_label=
+                            "Asociando consumo teórico a la semana...",
 
-                    week_mask = (
-                        weeks_mix[
-                            "week_id"
-                        ]
-                        == open_week_for_mix[
-                            "week_id"
-                        ]
+                        success_label=
+                            "Consumo teórico asociado correctamente.",
+
+                        error_label=
+                            "Falló la asociación del consumo teórico.",
+
+                        operation=
+                            lambda:
+                                save_week_theoretical_consumption(
+                                    week_id=
+                                        open_week_for_mix[
+                                            "week_id"
+                                        ],
+
+                                    consumo_teorico=
+                                        consumo_teorico,
+                                ),
                     )
 
-                    if week_mask.any():
-                        week_idx = weeks_mix[
-                            week_mask
-                        ].index[0]
-
-                        weeks_mix.loc[
-                            week_idx,
-                            "consumo_teorico_kg"
-                        ] = round(
-                            float(
-                                consumo_teorico
-                            ),
-                            3,
-                        )
-
-                        safe_write_csv(
-                            weeks_mix[
-                                WEEK_COLUMNS
-                            ],
-                            WEEKS_FILE,
-                        )
-
-                        refresh_all_metadata()
-
-                        st.success(
-                            "Consumo teórico asociado a la semana."
-                        )
-
+                    if ok:
                         st.rerun()
 
 
@@ -4816,8 +8366,9 @@ with tab_stock:
     )
 
     st.caption(
-        "Persistencia separada: salon_latas.csv para latas individuales "
-        "y camera_stock.csv con una fila por lata física de cámara."
+        "Persistencia separada: salon_latas.csv para salón, "
+        "camera_stock.csv para latas de granel y "
+        "camera_products.csv para otros productos de cámara."
     )
 
     camera_tab, salon_tab = st.tabs(
@@ -4828,238 +8379,1002 @@ with tab_stock:
     )
 
     with camera_tab:
-        stock = load_current_stock()
-
-        camera = stock[
-            (
-                stock[
-                    "location"
-                ]
-                == "CAMARA"
-            )
-            &
-            (
-                stock[
-                    "active"
-                ]
-                == True
-            )
-        ].copy()
-
         st.subheader(
             "❄️ Cámara"
         )
 
-        if camera.empty:
-            st.info(
-                "No hay stock cargado en cámara."
-            )
+        (
+            granel_tab,
+            familiares_tab,
+            tentaciones_tab,
+            postres_tab,
+            tortas_tab,
+            bombones_tab,
+            palitos_tab,
+            especiales_tab,
+            frizzio_tab,
+        ) = st.tabs(
+            [
+                "🍦 Granel",
+                "🍨 Familiares",
+                "🍧 Tentaciones",
+                "🍰 Postres",
+                "🎂 Tortas",
+                "🍫 Bombones",
+                "🍡 Palitos",
+                "🌱 Líneas especiales",
+                "🍕 Frizzio",
+            ]
+        )
 
-        else:
-            camera_editor = camera[
-                [
-                    "stock_id",
-                    "sabor",
-                    "estado",
-                    "kg_referencia_lata",
-                    "ingresada_camera_at",
-                ]
-            ].copy()
-
-            camera_editor.insert(
-                0,
-                "anular",
-                False,
-            )
-
-            edited_camera = st.data_editor(
-                camera_editor,
-                hide_index=True,
-                use_container_width=True,
-                disabled=[
-                    "stock_id",
-                    "sabor",
-                    "estado",
-                    "kg_referencia_lata",
-                    "ingresada_camera_at",
-                ],
-                column_config={
-                    "anular":
-                        st.column_config.CheckboxColumn(
-                            "🗑️ Anular",
-                            help=(
-                                "Marca una o más latas cargadas por error."
+        with granel_tab:
+                stock = load_current_stock()
+        
+                camera = stock[
+                    (
+                        stock[
+                            "location"
+                        ]
+                        == "CAMARA"
+                    )
+                    &
+                    (
+                        stock[
+                            "active"
+                        ]
+                        == True
+                    )
+                ].copy()
+        
+                st.subheader(
+                    "❄️ Cámara"
+                )
+        
+                if camera.empty:
+                    st.info(
+                        "No hay stock cargado en cámara."
+                    )
+        
+                else:
+                    # --------------------------------------------------------
+                    # KPIs de cámara
+                    # --------------------------------------------------------
+        
+                    camera[
+                        "kg_referencia_lata"
+                    ] = pd.to_numeric(
+                        camera[
+                            "kg_referencia_lata"
+                        ],
+                        errors="coerce",
+                    )
+        
+                    camera[
+                        "sabor"
+                    ] = (
+                        camera[
+                            "sabor"
+                        ]
+                        .map(
+                            normalize_flavor_name
+                        )
+                    )
+        
+                    total_camera_cans = int(
+                        len(
+                            camera
+                        )
+                    )
+        
+                    total_camera_flavors = int(
+                        camera[
+                            "sabor"
+                        ]
+                        .nunique()
+                    )
+        
+                    total_camera_kg = round(
+                        float(
+                            camera[
+                                "kg_referencia_lata"
+                            ]
+                            .fillna(0)
+                            .sum()
+                        ),
+                        3,
+                    )
+        
+                    k1, k2, k3 = st.columns(
+                        3
+                    )
+        
+                    k1.metric(
+                        "Sabores en cámara",
+                        total_camera_flavors,
+                    )
+        
+                    k2.metric(
+                        "Latas disponibles",
+                        total_camera_cans,
+                    )
+        
+                    k3.metric(
+                        "Stock estimado",
+                        f"{total_camera_kg:.3f} kg",
+                    )
+        
+                    # --------------------------------------------------------
+                    # Resumen por sabor
+                    # --------------------------------------------------------
+        
+                    st.markdown(
+                        "#### 📊 Resumen por sabor"
+                    )
+        
+                    camera_summary = (
+                        camera
+                        .groupby(
+                            "sabor",
+                            as_index=False,
+                        )
+                        .agg(
+                            latas_disponibles=(
+                                "stock_id",
+                                "count",
                             ),
-                            default=False,
-                        ),
-
-                    "stock_id":
-                        st.column_config.TextColumn(
-                            "Lata"
-                        ),
-
-                    "kg_referencia_lata":
-                        st.column_config.NumberColumn(
-                            "Kg referencia",
-                            format="%.3f kg",
-                        ),
-
-                    "ingresada_camera_at":
-                        st.column_config.TextColumn(
-                            "Ingreso cámara"
-                        ),
-                },
-                key="camera_stock_editor",
-            )
-
-            selected_to_annul = (
-                edited_camera.loc[
-                    edited_camera[
-                        "anular"
-                    ]
-                    == True,
-                    "stock_id",
-                ]
-                .astype(str)
-                .tolist()
-            )
-
-            if selected_to_annul:
-                st.warning(
-                    f"Vas a anular "
-                    f"{len(selected_to_annul)} "
-                    f"lata(s) de cámara. "
-                    "No se borran del historial."
-                )
-
-                annul_notes = st.text_input(
-                    "Motivo / observación de anulación",
-                    placeholder=(
-                        "Ej: carga duplicada, cantidad incorrecta..."
-                    ),
-                    key="camera_annul_notes",
-                )
-
-                confirm_annul = st.checkbox(
-                    "Confirmo que quiero anular las latas seleccionadas",
-                    key="confirm_camera_annul",
-                )
-
-                if st.button(
-                    "🗑️ Anular seleccionadas",
-                    key="annul_camera_selected",
-                    disabled=(
-                        not confirm_annul
-                    ),
-                ):
-                    try:
-                        result = annul_camera_latas(
-                            selected_to_annul,
-                            notes=
-                                annul_notes,
+        
+                            kg_estimados=(
+                                "kg_referencia_lata",
+                                "sum",
+                            ),
+        
+                            kg_promedio_lata=(
+                                "kg_referencia_lata",
+                                "mean",
+                            ),
                         )
-
-                        st.success(
-                            f"Se anularon "
-                            f"{result['cantidad']} lata(s) · "
-                            f"{result['operation_id']}"
+                        .sort_values(
+                            [
+                                "latas_disponibles",
+                                "sabor",
+                            ],
+                            ascending=[
+                                False,
+                                True,
+                            ],
                         )
-
-                        st.rerun()
-
-                    except ValueError as e:
-                        st.error(
-                            str(e)
+                    )
+        
+                    camera_summary[
+                        "kg_estimados"
+                    ] = (
+                        camera_summary[
+                            "kg_estimados"
+                        ]
+                        .fillna(0)
+                        .round(3)
+                    )
+        
+                    camera_summary[
+                        "kg_promedio_lata"
+                    ] = (
+                        camera_summary[
+                            "kg_promedio_lata"
+                        ]
+                        .fillna(0)
+                        .round(3)
+                    )
+        
+                    st.dataframe(
+                        camera_summary,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "sabor":
+                                st.column_config.TextColumn(
+                                    "Sabor"
+                                ),
+        
+                            "latas_disponibles":
+                                st.column_config.NumberColumn(
+                                    "Latas disponibles",
+                                    format="%d",
+                                ),
+        
+                            "kg_estimados":
+                                st.column_config.NumberColumn(
+                                    "Kg estimados",
+                                    format="%.3f kg",
+                                ),
+        
+                            "kg_promedio_lata":
+                                st.column_config.NumberColumn(
+                                    "Promedio por lata",
+                                    format="%.3f kg",
+                                ),
+                        },
+                    )
+        
+                    st.divider()
+        
+                    # --------------------------------------------------------
+                    # Detalle individual + filtro por sabor
+                    # --------------------------------------------------------
+        
+                    st.markdown(
+                        "#### 🔎 Detalle de latas"
+                    )
+        
+                    camera_flavor_options = (
+                        camera[
+                            "sabor"
+                        ]
+                        .dropna()
+                        .astype(str)
+                        .drop_duplicates()
+                        .sort_values()
+                        .tolist()
+                    )
+        
+                    selected_camera_flavor = st.selectbox(
+                        "Filtrar por sabor",
+                        options=[
+                            "Todos",
+                            *camera_flavor_options,
+                        ],
+                        index=0,
+                        key="camera_stock_flavor_filter",
+                    )
+        
+                    filtered_camera = (
+                        camera.copy()
+                        if selected_camera_flavor
+                        == "Todos"
+                        else camera[
+                            camera[
+                                "sabor"
+                            ]
+                            .eq(
+                                selected_camera_flavor
+                            )
+                        ].copy()
+                    )
+        
+                    filter_c1, filter_c2 = st.columns(
+                        2
+                    )
+        
+                    filter_c1.metric(
+                        "Latas mostradas",
+                        int(
+                            len(
+                                filtered_camera
+                            )
+                        ),
+                    )
+        
+                    filter_c2.metric(
+                        "Kg mostrados",
+                        (
+                            f"{float(filtered_camera['kg_referencia_lata'].fillna(0).sum()):.3f} kg"
+                        ),
+                    )
+        
+                    camera_editor = filtered_camera[
+                        [
+                            "stock_id",
+                            "sabor",
+                            "estado",
+                            "kg_referencia_lata",
+                            "ingresada_camera_at",
+                        ]
+                    ].copy()
+        
+                    camera_editor.insert(
+                        0,
+                        "anular",
+                        False,
+                    )
+        
+                    edited_camera = st.data_editor(
+                        camera_editor,
+                        hide_index=True,
+                        use_container_width=True,
+                        disabled=[
+                            "stock_id",
+                            "sabor",
+                            "estado",
+                            "kg_referencia_lata",
+                            "ingresada_camera_at",
+                        ],
+                        column_config={
+                            "anular":
+                                st.column_config.CheckboxColumn(
+                                    "🗑️ Anular",
+                                    help=(
+                                        "Marca una o más latas cargadas por error."
+                                    ),
+                                    default=False,
+                                ),
+        
+                            "stock_id":
+                                st.column_config.TextColumn(
+                                    "Lata"
+                                ),
+        
+                            "sabor":
+                                st.column_config.TextColumn(
+                                    "Sabor"
+                                ),
+        
+                            "estado":
+                                st.column_config.TextColumn(
+                                    "Estado"
+                                ),
+        
+                            "kg_referencia_lata":
+                                st.column_config.NumberColumn(
+                                    "Kg referencia",
+                                    format="%.3f kg",
+                                ),
+        
+                            "ingresada_camera_at":
+                                st.column_config.TextColumn(
+                                    "Ingreso cámara"
+                                ),
+                        },
+                        key=(
+                            "camera_stock_editor_"
+                            + selected_camera_flavor
+                            .replace(
+                                " ",
+                                "_",
+                            )
+                        ),
+                    )
+        
+                    selected_to_annul = (
+                        edited_camera.loc[
+                            edited_camera[
+                                "anular"
+                            ]
+                            == True,
+                            "stock_id",
+                        ]
+                        .astype(str)
+                        .tolist()
+                    )
+        
+                    if selected_to_annul:
+                        st.warning(
+                            f"Vas a anular "
+                            f"{len(selected_to_annul)} "
+                            f"lata(s) de cámara. "
+                            "No se borran del historial."
                         )
-
-        st.divider()
-
-        flavors = load_flavors()
-
-        if not flavors:
-            st.warning(
-                "No hay sabores configurados. "
-                "Agregalos desde Configuración."
-            )
-        else:
-            a1, a2, a3 = st.columns(
-                3
-            )
-
-            with a1:
-                camera_sabor = st.selectbox(
-                    "Sabor",
-                    options=flavors,
-                    index=None,
-                    placeholder="Seleccionar sabor",
-                    key="camera_sabor",
-                )
-
-            with a2:
-                camera_qty = st.number_input(
-                    "Cantidad de latas",
-                    min_value=1,
-                    value=1,
-                    step=1,
-                    key="camera_qty",
-                )
-
-            with a3:
-                camera_ref = st.number_input(
-                    "Peso neto de referencia por lata (kg)",
-                    min_value=0.100,
-                    max_value=MAX_CAN_GROSS_KG,
-                    value=DEFAULT_CAMERA_CAN_KG,
-                    step=0.005,
-                    format="%.3f",
-                    key="camera_ref",
-                    help=(
-                        "La app guarda todo en kilogramos. "
-                        "Ejemplo: 7580 g = 7.580 kg."
-                    ),
-                )
-
-            st.caption(
-                "Podés cargar varias juntas: si ponés 9, la app crea "
-                "9 IDs individuales CAM-xxx-xxxxxx."
-            )
-
-            camera_notes = st.text_area(
-                "Observaciones",
-                key="camera_notes",
-            )
-
-            if st.button(
-                "Agregar stock a cámara",
-                type="primary",
-                key="add_camera",
-            ):
-                if not camera_sabor:
-                    st.error(
-                        "Seleccioná un sabor."
+        
+                        annul_notes = st.text_input(
+                            "Motivo / observación de anulación",
+                            placeholder=(
+                                "Ej: carga duplicada, cantidad incorrecta..."
+                            ),
+                            key=(
+                                "camera_annul_notes_"
+                                + selected_camera_flavor
+                                .replace(
+                                    " ",
+                                    "_",
+                                )
+                            ),
+                        )
+        
+                        confirm_annul = st.checkbox(
+                            "Confirmo que quiero anular las latas seleccionadas",
+                            key=(
+                                "confirm_camera_annul_"
+                                + selected_camera_flavor
+                                .replace(
+                                    " ",
+                                    "_",
+                                )
+                            ),
+                        )
+        
+                        if st.button(
+                            "🗑️ Anular seleccionadas",
+                            key=(
+                                "annul_camera_selected_"
+                                + selected_camera_flavor
+                                .replace(
+                                    " ",
+                                    "_",
+                                )
+                            ),
+                            disabled=(
+                                not confirm_annul
+                            ),
+                        ):
+                            ok, result = run_ui_mutation(
+                                running_label=
+                                    "Anulando latas seleccionadas de cámara...",
+        
+                                success_label=
+                                    lambda result:
+                                        (
+                                            f"Se anularon "
+                                            f"{result['cantidad']} lata(s) · "
+                                            f"{result['operation_id']}"
+                                        ),
+        
+                                error_label=
+                                    "No se pudieron anular las latas.",
+        
+                                operation=
+                                    lambda:
+                                        annul_camera_latas(
+                                            selected_to_annul,
+                                            notes=
+                                                annul_notes,
+                                        ),
+                            )
+        
+                            if ok:
+                                st.rerun()
+        
+                st.divider()
+        
+                flavors = load_flavors()
+        
+                if not flavors:
+                    st.warning(
+                        "No hay sabores configurados. "
+                        "Agregalos desde Configuración."
                     )
                 else:
-                    try:
-                        add_camera_stock(
-                            sabor=
-                                camera_sabor,
+                    a1, a2, a3 = st.columns(
+                        3
+                    )
+        
+                    with a1:
+                        camera_sabor = st.selectbox(
+                            "Sabor",
+                            options=flavors,
+                            index=None,
+                            placeholder="Seleccionar sabor",
+                            key="camera_sabor",
+                        )
+        
+                    with a2:
+                        camera_qty = st.number_input(
+                            "Cantidad de latas",
+                            min_value=1,
+                            value=1,
+                            step=1,
+                            key="camera_qty",
+                        )
+        
+                    with a3:
+                        camera_ref = st.number_input(
+                            "Peso neto de referencia por lata (kg)",
+                            min_value=0.100,
+                            max_value=MAX_CAN_GROSS_KG,
+                            value=DEFAULT_CAMERA_CAN_KG,
+                            step=0.005,
+                            format="%.3f",
+                            key="camera_ref",
+                            help=(
+                                "La app guarda todo en kilogramos. "
+                                "Ejemplo: 7580 g = 7.580 kg."
+                            ),
+                        )
+        
+                    st.caption(
+                        "Podés cargar varias juntas: si ponés 9, la app crea "
+                        "9 IDs individuales CAM-xxx-xxxxxx."
+                    )
+        
+                    camera_notes = st.text_area(
+                        "Observaciones",
+                        key="camera_notes",
+                    )
+        
+                    if st.button(
+                        "Agregar stock a cámara",
+                        type="primary",
+                        key="add_camera",
+                    ):
+                        if not camera_sabor:
+                            st.error(
+                                "Seleccioná un sabor."
+                            )
+                        else:
+                            ok, camera_ids = run_ui_mutation(
+                                running_label=
+                                    (
+                                        f"Agregando {int(camera_qty)} lata(s) "
+                                        f"de {camera_sabor} a cámara..."
+                                    ),
+        
+                                success_label=
+                                    lambda camera_ids:
+                                        (
+                                            f"Stock agregado correctamente · "
+                                            f"{len(camera_ids)} lata(s)."
+                                        ),
+        
+                                error_label=
+                                    "Falló el ingreso de stock a cámara.",
+        
+                                operation=
+                                    lambda:
+                                        add_camera_stock(
+                                            sabor=
+                                                camera_sabor,
+        
+                                            cantidad_latas=
+                                                camera_qty,
+        
+                                            kg_referencia_lata=
+                                                camera_ref,
+        
+                                            notes=
+                                                camera_notes,
+                                        ),
+                            )
+        
+                            if ok:
+                                st.rerun()
+        
 
-                            cantidad_latas=
-                                camera_qty,
+        def render_camera_product_category(category_name,tab_key):
+            products=load_camera_products(active_only=True)
+            category_products=products[products["categoria"].astype(str).eq(category_name)].copy()
+            allowed_subcategories=CATEGORY_SUBCATEGORIES.get(category_name,[])
+            selected_subcategory_filter="TODAS"
+            if allowed_subcategories:
+                selected_subcategory_filter=st.selectbox("Filtrar subcategoría",["TODAS",*allowed_subcategories],key=f"camera_product_subcategory_filter_{tab_key}")
+                if selected_subcategory_filter!="TODAS": category_products=category_products[category_products["subcategoria"].astype(str).eq(selected_subcategory_filter)].copy()
+            if category_products.empty: st.info(f"No hay productos cargados en {category_name.replace('_',' ').title()}.")
+            else:
+                k1,k2=st.columns(2); k1.metric("Productos",int(category_products["producto"].nunique())); k2.metric("Unidades totales",int(pd.to_numeric(category_products["total_unidades"],errors="coerce").fillna(0).sum()))
+                display=category_products[["product_stock_id","product_code","subcategoria","producto","packaging_mode","cantidad_packs","cantidad_cajas","total_cajas","total_unidades","created_at"]].copy(); display.insert(0,"anular",False)
+                edited_products=st.data_editor(display,hide_index=True,use_container_width=True,disabled=[c for c in display.columns if c!="anular"],key=f"camera_products_editor_{tab_key}")
+                selected_products=edited_products.loc[edited_products["anular"]==True,"product_stock_id"].astype(str).tolist()
+                if selected_products:
+                    notes=st.text_input("Motivo de anulación",key=f"camera_product_annul_notes_{tab_key}"); confirm=st.checkbox("Confirmo la anulación",key=f"camera_product_annul_confirm_{tab_key}")
+                    if st.button("🗑️ Anular seleccionadas",key=f"camera_product_annul_button_{tab_key}",disabled=not confirm):
+                        def op(): return [annul_camera_product(product_stock_id=x,notes=notes) for x in selected_products]
+                        ok,_=run_ui_mutation(running_label="Anulando productos...",success_label="Productos anulados.",error_label="No se pudieron anular.",operation=op)
+                        if ok: st.rerun()
+            st.divider(); st.markdown("#### ➕ Agregar stock")
+            sub=None
+            if allowed_subcategories: sub=st.selectbox("Subcategoría",allowed_subcategories,key=f"camera_product_subcategory_{tab_key}")
+            catalog=catalog_products_for(categoria=category_name,subcategoria=sub)
+            if catalog.empty:
+                st.warning("No hay productos configurados. Agregalos en Configuración → Productos."); return
+            def label(row):
+                mode = str(
+                    row.get(
+                        "packaging_mode",
+                        PACKAGING_PACK_UNITS,
+                    )
+                )
 
-                            kg_referencia_lata=
-                                camera_ref,
+                cajas_por_pack = pd.to_numeric(
+                    row.get(
+                        "cajas_por_pack",
+                        row.get(
+                            "cajas_por_bulto",
+                            pd.NA,
+                        ),
+                    ),
+                    errors="coerce",
+                )
 
-                            notes=
-                                camera_notes,
+                unidades_por_pack = pd.to_numeric(
+                    row.get(
+                        "unidades_por_pack",
+                        row.get(
+                            "unidades_por_bulto",
+                            pd.NA,
+                        ),
+                    ),
+                    errors="coerce",
+                )
+
+                unidades_por_caja = pd.to_numeric(
+                    row.get(
+                        "unidades_por_caja",
+                        pd.NA,
+                    ),
+                    errors="coerce",
+                )
+
+                if mode == PACKAGING_PACK_BOXES_UNITS:
+                    if (
+                        pd.isna(
+                            cajas_por_pack
+                        )
+                        or pd.isna(
+                            unidades_por_caja
+                        )
+                    ):
+                        detail = "configuración incompleta"
+                    else:
+                        detail = (
+                            f"{int(cajas_por_pack)} cajas/pack × "
+                            f"{int(unidades_por_caja)} unid/caja"
                         )
 
-                        st.rerun()
-
-                    except ValueError as e:
-                        st.error(
-                            str(e)
+                elif mode == PACKAGING_PACK_UNITS:
+                    if pd.isna(
+                        unidades_por_pack
+                    ):
+                        detail = "configuración incompleta"
+                    else:
+                        detail = (
+                            f"{int(unidades_por_pack)} unid/pack"
                         )
+
+                else:
+                    if pd.isna(
+                        unidades_por_caja
+                    ):
+                        detail = "configuración incompleta"
+                    else:
+                        detail = (
+                            f"{int(unidades_por_caja)} unid/caja"
+                        )
+
+                return (
+                    f"{row.get('producto', 'SIN_NOMBRE')} · "
+                    f"{detail}"
+                )
+            mp={label(r):r["product_code"] for _,r in catalog.iterrows()}; lbl=st.selectbox("Producto",list(mp),key=f"camera_product_catalog_select_{tab_key}"); code=mp[lbl]; row=catalog[catalog["product_code"].astype(str).eq(code)].iloc[0]
+            mode = str(
+                row.get(
+                    "packaging_mode",
+                    PACKAGING_PACK_UNITS,
+                )
+            )
+
+            cpp_value = pd.to_numeric(
+                row.get(
+                    "cajas_por_pack",
+                    row.get(
+                        "cajas_por_bulto",
+                        pd.NA,
+                    ),
+                ),
+                errors="coerce",
+            )
+
+            upp_value = pd.to_numeric(
+                row.get(
+                    "unidades_por_pack",
+                    row.get(
+                        "unidades_por_bulto",
+                        pd.NA,
+                    ),
+                ),
+                errors="coerce",
+            )
+
+            upc_value = pd.to_numeric(
+                row.get(
+                    "unidades_por_caja",
+                    pd.NA,
+                ),
+                errors="coerce",
+            )
+
+            cpp = (
+                int(
+                    cpp_value
+                )
+                if pd.notna(
+                    cpp_value
+                )
+                else None
+            )
+
+            upp = (
+                int(
+                    upp_value
+                )
+                if pd.notna(
+                    upp_value
+                )
+                else None
+            )
+
+            upc = (
+                int(
+                    upc_value
+                )
+                if pd.notna(
+                    upc_value
+                )
+                else None
+            )
+            packaging_config_valid = True
+            packaging_error = None
+
+            if mode == PACKAGING_PACK_BOXES_UNITS:
+                if cpp is None or upc is None:
+                    packaging_config_valid = False
+                    packaging_error = (
+                        "Este producto necesita Cajas por pack y "
+                        "Unidades por caja."
+                    )
+
+            elif mode == PACKAGING_PACK_UNITS:
+                if upp is None:
+                    packaging_config_valid = False
+                    packaging_error = (
+                        "Este producto necesita Unidades por pack."
+                    )
+
+            elif mode == PACKAGING_BOX_UNITS:
+                if upc is None:
+                    packaging_config_valid = False
+                    packaging_error = (
+                        "Este producto necesita Unidades por caja."
+                    )
+
+            else:
+                packaging_config_valid = False
+                packaging_error = (
+                    f"Packaging mode desconocido: {mode}"
+                )
+
+            with st.form(
+                f"camera_product_stock_form_{tab_key}"
+            ):
+                packs = None
+                cajas = None
+                total = None
+
+                if not packaging_config_valid:
+                    st.error(
+                        packaging_error
+                    )
+
+                    st.caption(
+                        "Corregí este producto en "
+                        "Configuración → Productos."
+                    )
+
+                elif mode == PACKAGING_PACK_BOXES_UNITS:
+                    st.caption(
+                        "PACK → CAJAS → UNIDADES"
+                    )
+
+                    a, b = st.columns(
+                        2
+                    )
+
+                    a.metric(
+                        "Cajas por pack",
+                        cpp,
+                    )
+
+                    b.metric(
+                        "Unidades por caja",
+                        upc,
+                    )
+
+                    packs = st.number_input(
+                        "Cantidad de packs",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                    )
+
+                    total = (
+                        packs
+                        * cpp
+                        * upc
+                    )
+
+                    st.info(
+                        f"{packs} pack(s) × {cpp} cajas × {upc} unidades "
+                        f"= **{total} unidades**. "
+                        f"Se crearán **{packs} IDs individuales**, uno por pack."
+                    )
+
+                elif mode == PACKAGING_PACK_UNITS:
+                    st.caption(
+                        "PACK → UNIDADES"
+                    )
+
+                    st.metric(
+                        "Unidades por pack",
+                        upp,
+                    )
+
+                    packs = st.number_input(
+                        "Cantidad de packs",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                    )
+
+                    total = (
+                        packs
+                        * upp
+                    )
+
+                    st.info(
+                        f"{packs} pack(s) × {upp} unidades "
+                        f"= **{total} unidades**. "
+                        f"Se crearán **{packs} IDs individuales**, uno por pack."
+                    )
+
+                elif mode == PACKAGING_BOX_UNITS:
+                    st.caption(
+                        "CAJA → UNIDADES"
+                    )
+
+                    st.metric(
+                        "Unidades por caja",
+                        upc,
+                    )
+
+                    cajas = st.number_input(
+                        "Cantidad de cajas",
+                        min_value=1,
+                        value=1,
+                        step=1,
+                    )
+
+                    total = (
+                        cajas
+                        * upc
+                    )
+
+                    st.info(
+                        f"{cajas} caja(s) × {upc} unidades "
+                        f"= **{total} unidades**. "
+                        f"Se crearán **{cajas} IDs individuales**, uno por caja."
+                    )
+
+                notes = st.text_area(
+                    "Observaciones"
+                )
+
+                submit = st.form_submit_button(
+                    "Agregar a cámara",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(
+                        not packaging_config_valid
+                    ),
+                )
+            if submit:
+                ok, result = run_ui_mutation(
+                    running_label=
+                        f"Agregando {row['producto']} a cámara...",
+
+                    success_label=
+                        lambda result:
+                            (
+                                f"Stock agregado · "
+                                f"{result['physical_count']} "
+                                f"{result['physical_label']}(s) · "
+                                f"{result['total_unidades']} unidades · "
+                                f"{len(result['created_ids'])} IDs creados."
+                            ),
+
+                    error_label=
+                        "No se pudo agregar el stock.",
+
+                    operation=
+                        lambda:
+                            add_camera_product(
+                                product_code=
+                                    row[
+                                        "product_code"
+                                    ],
+
+                                categoria=
+                                    row[
+                                        "categoria"
+                                    ],
+
+                                subcategoria=
+                                    (
+                                        row[
+                                            "subcategoria"
+                                        ]
+                                        if pd.notna(
+                                            row[
+                                                "subcategoria"
+                                            ]
+                                        )
+                                        else None
+                                    ),
+
+                                producto=
+                                    row[
+                                        "producto"
+                                    ],
+
+                                packaging_mode=
+                                    mode,
+
+                                cantidad_packs=
+                                    packs,
+
+                                cantidad_cajas=
+                                    cajas,
+
+                                cajas_por_pack=
+                                    cpp,
+
+                                unidades_por_pack=
+                                    upp,
+
+                                unidades_por_caja=
+                                    upc,
+
+                                notes=
+                                    notes,
+                            ),
+                )
+
+                if ok:
+                    st.rerun()
+
+
+        with familiares_tab:
+            render_camera_product_category(
+                "FAMILIARES",
+                "familiares",
+            )
+
+        with tentaciones_tab:
+            render_camera_product_category(
+                "TENTACIONES",
+                "tentaciones",
+            )
+
+        with postres_tab:
+            render_camera_product_category(
+                "POSTRES",
+                "postres",
+            )
+
+        with tortas_tab:
+            render_camera_product_category(
+                "TORTAS",
+                "tortas",
+            )
+
+        with bombones_tab:
+            render_camera_product_category(
+                "BOMBONES",
+                "bombones",
+            )
+
+        with palitos_tab:
+            render_camera_product_category(
+                "PALITOS",
+                "palitos",
+            )
+
+        with especiales_tab:
+            render_camera_product_category(
+                "LINEAS_ESPECIALES",
+                "lineas_especiales",
+            )
+
+        with frizzio_tab:
+            render_camera_product_category(
+                "FRIZZIO",
+                "frizzio",
+            )
+
 
     with salon_tab:
         stock = load_current_stock()
@@ -5194,27 +9509,38 @@ with tab_stock:
                     type="primary",
                     key="open_salon_can_button",
                 ):
-                    try:
-                        open_salon_can(
-                            stock_id=
-                                open_options[
-                                    selected_open_label
-                                ],
+                    selected_open_stock_id = (
+                        open_options[
+                            selected_open_label
+                        ]
+                    )
 
-                            notes=
-                                open_notes,
-                        )
+                    ok, _ = run_ui_mutation(
+                        running_label=
+                            (
+                                f"Abriendo lata "
+                                f"{selected_open_stock_id}..."
+                            ),
 
-                        st.success(
-                            "Lata marcada como ABIERTA."
-                        )
+                        success_label=
+                            "Lata abierta y movimiento registrado.",
 
+                        error_label=
+                            "No se pudo abrir la lata.",
+
+                        operation=
+                            lambda:
+                                open_salon_can(
+                                    stock_id=
+                                        selected_open_stock_id,
+
+                                    notes=
+                                        open_notes,
+                                ),
+                    )
+
+                    if ok:
                         st.rerun()
-
-                    except ValueError as e:
-                        st.error(
-                            str(e)
-                        )
 
         with op2:
             st.markdown(
@@ -5375,59 +9701,54 @@ with tab_stock:
                     "✅ Terminar lata",
                     key="finish_salon_can_button",
                 ):
-                    try:
-                        result = mark_salon_can_empty(
-                            stock_id=
-                                selected_finish_id,
+                    ok, result = run_ui_mutation(
+                        running_label=
+                            (
+                                f"Finalizando lata "
+                                f"{selected_finish_id}..."
+                            ),
 
-                            tara_final_kg=
-                                finish_tara_final,
+                        success_label=
+                            lambda result:
+                                (
+                                    "Lata finalizada · "
+                                    f"tara final "
+                                    f"{result['tara_final_kg']:.3f} kg"
+                                    + (
+                                        f" · residuo estimado "
+                                        f"{result['residuo_final_kg']:.3f} kg"
+                                        if (
+                                            result[
+                                                "residuo_final_kg"
+                                            ]
+                                            is not None
+                                        )
+                                        else ""
+                                    )
+                                ),
 
-                            peso_final_bruto_kg=
-                                None,
+                        error_label=
+                            "No se pudo finalizar la lata.",
 
-                            notes=
-                                finish_notes,
-                        )
+                        operation=
+                            lambda:
+                                mark_salon_can_empty(
+                                    stock_id=
+                                        selected_finish_id,
 
-                        success_msg = (
-                            "Lata marcada como AGOTADA · "
-                            f"tara final "
-                            f"{result['tara_final_kg']:.3f} kg"
-                        )
+                                    tara_final_kg=
+                                        finish_tara_final,
 
-                        if (
-                            result[
-                                "residuo_final_kg"
-                            ]
-                            is not None
-                        ):
-                            success_msg += (
-                                f" · residuo estimado "
-                                f"{result['residuo_final_kg']:.3f} kg"
-                            )
+                                    peso_final_bruto_kg=
+                                        None,
 
-                        if (
-                            result[
-                                "residuo_final_kg"
-                            ]
-                            is not None
-                        ):
-                            success_msg += (
-                                f" · residuo "
-                                f"{result['residuo_final_kg']:.3f} kg"
-                            )
+                                    notes=
+                                        finish_notes,
+                                ),
+                    )
 
-                        st.success(
-                            success_msg
-                        )
-
+                    if ok:
                         st.rerun()
-
-                    except ValueError as e:
-                        st.error(
-                            str(e)
-                        )
 
 
 
@@ -5850,74 +10171,83 @@ with tab_stock:
                 type="primary",
                 key="perform_replacement_button",
             ):
-                try:
-                    result = perform_salon_replacement(
-                        current_open_stock_id=
-                            current_change_id,
+                ok, result = run_ui_mutation(
+                    running_label=
+                        (
+                            f"Registrando recambio de "
+                            f"{current_change_id}..."
+                        ),
 
-                        tara_final_kg=
-                            replacement_final_tare,
+                    success_label=
+                        lambda result:
+                            (
+                                f"Recambio registrado · "
+                                f"{result['operation_id']}"
+                                + (
+                                    f" · Abierta "
+                                    f"{result['opened_reserve_stock_id']}"
+                                    if (
+                                        result[
+                                            "opened_reserve_stock_id"
+                                        ]
+                                        is not None
+                                    )
+                                    else ""
+                                )
+                                + (
+                                    f" · Nueva "
+                                    f"{result['new_salon_stock_id']} "
+                                    f"{result['new_salon_state']}"
+                                    if result[
+                                        "replenished"
+                                    ]
+                                    else ""
+                                )
+                                + (
+                                    f" · CAMBIO_SABOR → "
+                                    f"{result['cambio_sabor_target_stock_id']}"
+                                    if result[
+                                        "cambio_sabor_registered"
+                                    ]
+                                    else ""
+                                )
+                            ),
 
-                        peso_final_bruto_kg=
-                            replacement_finished_gross,
+                    error_label=
+                        "No se pudo completar el recambio.",
 
-                        reserve_stock_id=
-                            reserve_stock_id,
+                    operation=
+                        lambda:
+                            perform_salon_replacement(
+                                current_open_stock_id=
+                                    current_change_id,
 
-                        replenish_from_camera=
-                            replenish_from_camera,
+                                tara_final_kg=
+                                    replacement_final_tare,
 
-                        peso_bruto_kg=
-                            replacement_bruto,
+                                peso_final_bruto_kg=
+                                    replacement_finished_gross,
 
-                        tara_kg=
-                            replacement_tara,
+                                reserve_stock_id=
+                                    reserve_stock_id,
 
-                        notes=
-                            replacement_notes,
-                    )
+                                replenish_from_camera=
+                                    replenish_from_camera,
 
-                    msg = (
-                        f"Recambio registrado · "
-                        f"{result['operation_id']}"
-                    )
+                                peso_bruto_kg=
+                                    replacement_bruto,
 
-                    if (
-                        result[
-                            "opened_reserve_stock_id"
-                        ]
-                        is not None
-                    ):
-                        msg += (
-                            f" · Abierta "
-                            f"{result['opened_reserve_stock_id']}"
-                        )
+                                tara_kg=
+                                    replacement_tara,
 
-                    if result["replenished"]:
-                        msg += (
-                            f" · Nueva "
-                            f"{result['new_salon_stock_id']} "
-                            f"{result['new_salon_state']}"
-                        )
+                                notes=
+                                    replacement_notes,
+                            ),
+                )
 
-                    if result[
-                        "cambio_sabor_registered"
-                    ]:
-                        msg += (
-                            f" · CAMBIO_SABOR → "
-                            f"{result['cambio_sabor_target_stock_id']}"
-                        )
-
-                    st.success(
-                        msg
-                    )
-
+                if ok:
                     st.rerun()
 
-                except ValueError as e:
-                    st.error(
-                        str(e)
-                    )
 
 
 # ============================================================
@@ -6096,27 +10426,43 @@ with tab_transfer:
             "Registrar y pasar al salón",
             type="primary",
         ):
-            try:
-                move_camera_flavor_to_salon(
-                    sabor=
-                        selected_flavor,
+            ok, result = run_ui_mutation(
+                running_label=
+                    (
+                        f"Moviendo {fifo_camera_id} "
+                        f"de cámara al salón..."
+                    ),
 
-                    peso_bruto_kg=
-                        transfer_bruto,
+                success_label=
+                    lambda result:
+                        (
+                            f"Lata trasladada al salón · "
+                            f"{result[0]} · "
+                            f"{result[1]:.3f} kg netos."
+                        ),
 
-                    tara_kg=
-                        transfer_tara,
+                error_label=
+                    "No se pudo pasar la lata al salón.",
 
-                    notes=
-                        transfer_notes,
-                )
+                operation=
+                    lambda:
+                        move_camera_flavor_to_salon(
+                            sabor=
+                                selected_flavor,
 
+                            peso_bruto_kg=
+                                transfer_bruto,
+
+                            tara_kg=
+                                transfer_tara,
+
+                            notes=
+                                transfer_notes,
+                        ),
+            )
+
+            if ok:
                 st.rerun()
-
-            except ValueError as e:
-                st.error(
-                    str(e)
-                )
 
 
 # ============================================================
@@ -6145,9 +10491,14 @@ with tab_count:
             "Tipo de conteo",
             [
                 "Control",
-                "Cierre de semana",
             ],
             horizontal=True,
+        )
+
+        st.info(
+            "El conteo de CIERRE se realiza dentro de "
+            "📅 Semanas → Ficha de semana → Cierre de semana. "
+            "Acá podés seguir haciendo controles físicos intermedios."
         )
 
     COUNT_TYPE_MAP = {
@@ -6156,9 +10507,6 @@ with tab_count:
 
         "Control":
             "CONTROL",
-
-        "Cierre de semana":
-            "CIERRE_SEMANA",
     }
 
     count_type = (
@@ -6414,58 +10762,95 @@ with tab_count:
         "💾 Registrar conteo",
         type="primary",
     ):
-        try:
-            result = save_salon_count(
-                edited_df=
-                    edited_count,
+        count_action_label = (
+            "Iniciando semana y guardando conteo..."
+            if count_type == "INICIO_SEMANA"
+            else "Guardando conteo físico del salón..."
+        )
 
-                count_type=
-                    count_type,
+        with st.status(
+            f"⏳ {count_action_label}",
+            expanded=True,
+        ) as count_status:
 
-                notes=
-                    count_notes,
+            count_status.write(
+                "Guardando inventario, movimientos y datos de la semana."
             )
 
-        except ValueError as e:
-            st.error(
-                str(e)
-            )
+            try:
+                result = save_salon_count(
+                    edited_df=
+                        edited_count,
 
-            st.stop()
+                    count_type=
+                        count_type,
 
-        if result[
-            "valid_rows"
-        ] == 0:
-            st.error(
-                "No se pudo guardar "
-                "ninguna fila válida."
-            )
-
-            for error in result[
-                "errors"
-            ]:
-                st.warning(error)
-
-        else:
-            if count_type == "INICIO_SEMANA":
-                st.success(
-                    f"Semana iniciada · "
-                    f"{result['total_stock_kg']:.3f} kg"
+                    notes=
+                        count_notes,
                 )
 
-            elif count_type == "CIERRE_SEMANA":
-                st.success(
-                    f"Semana cerrada · "
-                    f"{result['total_stock_kg']:.3f} kg"
+                if result[
+                    "valid_rows"
+                ] == 0:
+                    count_status.update(
+                        label=
+                            "❌ No se pudo guardar ninguna fila válida.",
+
+                        state=
+                            "error",
+
+                        expanded=
+                            True,
+                    )
+
+                    for error in result[
+                        "errors"
+                    ]:
+                        st.warning(
+                            error
+                        )
+
+                else:
+                    if count_type == "INICIO_SEMANA":
+                        final_label = (
+                            f"Semana iniciada · "
+                            f"{result['total_stock_kg']:.3f} kg"
+                        )
+
+                    else:
+                        final_label = (
+                            f"Conteo guardado · "
+                            f"{result['total_stock_kg']:.3f} kg"
+                        )
+
+                    count_status.update(
+                        label=
+                            f"✅ {final_label}",
+
+                        state=
+                            "complete",
+
+                        expanded=
+                            False,
+                    )
+
+                    st.rerun()
+
+            except Exception as exc:
+                count_status.update(
+                    label=
+                        "❌ Falló el guardado del conteo.",
+
+                    state=
+                        "error",
+
+                    expanded=
+                        True,
                 )
 
-            else:
-                st.success(
-                    f"Conteo guardado · "
-                    f"{result['total_stock_kg']:.3f} kg"
+                st.error(
+                    f"{type(exc).__name__}: {exc}"
                 )
-
-            st.rerun()
 
 
 # ============================================================
@@ -6489,24 +10874,34 @@ with tab_weeks:
             "🔄 Recalcular metadata",
             key="refresh_week_metadata_button",
         ):
-            report = refresh_all_metadata(
-                show_result=True
+            ok, report = run_ui_mutation(
+                running_label=
+                    "Recalculando y sincronizando metadata...",
+
+                success_label=
+                    "Metadata recalculada y sincronizada.",
+
+                error_label=
+                    "Falló el recálculo de metadata.",
+
+                operation=
+                    lambda:
+                        refresh_all_metadata(
+                            show_result=True
+                        ),
             )
 
-            st.success(
-                "Metadata recalculada."
-            )
+            if ok:
+                if report[
+                    "ambiguous_stock_ids"
+                ]:
+                    st.warning(
+                        "Hay IDs de lata duplicados. "
+                        "La migración de metadata de esas latas fue omitida "
+                        "para no asociar eventos a la fila incorrecta."
+                    )
 
-            if report[
-                "ambiguous_stock_ids"
-            ]:
-                st.warning(
-                    "Hay IDs de lata duplicados. "
-                    "La migración de metadata de esas latas fue omitida "
-                    "para no asociar eventos a la fila incorrecta."
-                )
-
-            st.rerun()
+                st.rerun()
 
     with refresh_col2:
         st.caption(
@@ -6553,10 +10948,48 @@ with tab_weeks:
             if col in weeks.columns
         ]
 
+        weeks_summary_view = weeks[
+            visible_columns
+        ].copy()
+
+        # Compact totals by category for the main weeks table.
+        for category in PRODUCT_SNAPSHOT_CATEGORIES:
+            column_name = (
+                f"{category.lower()}_actual"
+            )
+
+            weeks_summary_view[
+                column_name
+            ] = weeks.apply(
+                lambda row:
+                    product_snapshot_display_value(
+                        category,
+                        products_snapshot_from_json(
+                            (
+                                row.get(
+                                    "end_products_snapshot_json"
+                                )
+                                if str(
+                                    row.get(
+                                        "status",
+                                        ""
+                                    )
+                                ).upper()
+                                == "CLOSED"
+                                else row.get(
+                                    "current_products_snapshot_json"
+                                )
+                            )
+                        ).get(
+                            category,
+                            {},
+                        ),
+                    ),
+                axis=1,
+            )
+
         st.dataframe(
-            weeks[
-                visible_columns
-            ],
+            weeks_summary_view,
             hide_index=True,
             use_container_width=True,
             column_config={
@@ -6770,6 +11203,394 @@ with tab_weeks:
         )
 
         st.markdown(
+            "#### 🧊 Productos en cámara"
+        )
+
+        start_products_snapshot = (
+            products_snapshot_from_json(
+                selected_week_row.get(
+                    "start_products_snapshot_json"
+                )
+            )
+        )
+
+        current_products_snapshot = (
+            products_snapshot_from_json(
+                selected_week_row.get(
+                    "current_products_snapshot_json"
+                )
+            )
+        )
+
+        end_products_snapshot = (
+            products_snapshot_from_json(
+                selected_week_row.get(
+                    "end_products_snapshot_json"
+                )
+            )
+        )
+
+        product_inventory_rows = []
+
+        for category in PRODUCT_SNAPSHOT_CATEGORIES:
+
+            start_values = (
+                start_products_snapshot.get(
+                    category,
+                    {},
+                )
+            )
+
+            current_values = (
+                current_products_snapshot.get(
+                    category,
+                    {},
+                )
+            )
+
+            end_values = (
+                end_products_snapshot.get(
+                    category,
+                    {},
+                )
+            )
+
+            # Hide completely empty categories only if the category
+            # never had inventory during this Week.
+            if (
+                product_snapshot_category_totals(
+                    start_values
+                )[
+                    "units"
+                ]
+                == 0
+                and int(
+                    current_values.get(
+                        "units",
+                        0,
+                    )
+                    or 0
+                )
+                == 0
+                and int(
+                    end_values.get(
+                        "units",
+                        0,
+                    )
+                    or 0
+                )
+                == 0
+            ):
+                continue
+
+            product_inventory_rows.append(
+                {
+                    "Categoría":
+                        category.replace(
+                            "_",
+                            " ",
+                        ).title(),
+
+                    "Inicio":
+                        product_snapshot_display_value(
+                            category,
+                            start_values,
+                        ),
+
+                    "Actual":
+                        product_snapshot_display_value(
+                            category,
+                            current_values,
+                        ),
+
+                    "Cierre":
+                        (
+                            product_snapshot_display_value(
+                                category,
+                                end_values,
+                            )
+                            if end_values
+                            else "-"
+                        ),
+
+                    "Unidades inicio":
+                        int(
+                            start_values.get(
+                                "units",
+                                0,
+                            )
+                            or 0
+                        ),
+
+                    "Unidades actual":
+                        int(
+                            current_values.get(
+                                "units",
+                                0,
+                            )
+                            or 0
+                        ),
+
+                    "Unidades cierre":
+                        (
+                            int(
+                                end_values.get(
+                                    "units",
+                                    0,
+                                )
+                                or 0
+                            )
+                            if end_values
+                            else None
+                        ),
+                }
+            )
+
+        if product_inventory_rows:
+            product_inventory_df = pd.DataFrame(
+                product_inventory_rows
+            )
+
+            ps1, ps2, ps3 = st.columns(
+                3
+            )
+
+            ps1.metric(
+                "Unidades iniciales",
+                product_snapshot_units_total(
+                    start_products_snapshot
+                ),
+            )
+
+            ps2.metric(
+                "Unidades actuales",
+                product_snapshot_units_total(
+                    current_products_snapshot
+                ),
+            )
+
+            ps3.metric(
+                "Unidades al cierre",
+                (
+                    product_snapshot_units_total(
+                        end_products_snapshot
+                    )
+                    if end_products_snapshot
+                    else "-"
+                ),
+            )
+
+            st.dataframe(
+                product_inventory_df[
+                    [
+                        "Categoría",
+                        "Inicio",
+                        "Actual",
+                        "Cierre",
+                    ]
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+            with st.expander(
+                "🔎 Ver detalle por producto"
+            ):
+                detail_rows = []
+
+                for category in PRODUCT_SNAPSHOT_CATEGORIES:
+                    start_category = (
+                        start_products_snapshot.get(
+                            category,
+                            {},
+                        )
+                    )
+
+                    current_category = (
+                        current_products_snapshot.get(
+                            category,
+                            {},
+                        )
+                    )
+
+                    end_category = (
+                        end_products_snapshot.get(
+                            category,
+                            {},
+                        )
+                    )
+
+                    start_products = (
+                        product_snapshot_category_products(
+                            start_category
+                        )
+                    )
+
+                    current_products = (
+                        product_snapshot_category_products(
+                            current_category
+                        )
+                    )
+
+                    end_products = (
+                        product_snapshot_category_products(
+                            end_category
+                        )
+                    )
+
+                    product_codes = sorted(
+                        set(
+                            start_products.keys()
+                        )
+                        |
+                        set(
+                            current_products.keys()
+                        )
+                        |
+                        set(
+                            end_products.keys()
+                        )
+                    )
+
+                    for product_code in product_codes:
+                        start_product = (
+                            start_products.get(
+                                product_code,
+                                {},
+                            )
+                        )
+
+                        current_product = (
+                            current_products.get(
+                                product_code,
+                                {},
+                            )
+                        )
+
+                        end_product = (
+                            end_products.get(
+                                product_code,
+                                {},
+                            )
+                        )
+
+                        product_name = (
+                            current_product.get(
+                                "producto"
+                            )
+                            or end_product.get(
+                                "producto"
+                            )
+                            or start_product.get(
+                                "producto"
+                            )
+                            or product_code
+                        )
+
+                        packaging_mode = (
+                            current_product.get(
+                                "packaging_mode"
+                            )
+                            or end_product.get(
+                                "packaging_mode"
+                            )
+                            or start_product.get(
+                                "packaging_mode"
+                            )
+                            or ""
+                        )
+
+                        detail_rows.append(
+                            {
+                                "Categoría":
+                                    category.replace(
+                                        "_",
+                                        " ",
+                                    ).title(),
+
+                                "Producto":
+                                    product_name,
+
+                                "Código":
+                                    product_code,
+
+                                "Estructura":
+                                    packaging_mode,
+
+                                "Inicio":
+                                    int(
+                                        start_product.get(
+                                            "units",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+
+                                "Actual":
+                                    int(
+                                        current_product.get(
+                                            "units",
+                                            0,
+                                        )
+                                        or 0
+                                    ),
+
+                                "Cierre":
+                                    (
+                                        int(
+                                            end_product.get(
+                                                "units",
+                                                0,
+                                            )
+                                            or 0
+                                        )
+                                        if end_product
+                                        else None
+                                    ),
+                            }
+                        )
+
+                if detail_rows:
+                    st.dataframe(
+                        pd.DataFrame(
+                            detail_rows
+                        ),
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Inicio":
+                                st.column_config.NumberColumn(
+                                    "Inicio (u.)",
+                                    format="%d",
+                                ),
+
+                            "Actual":
+                                st.column_config.NumberColumn(
+                                    "Actual (u.)",
+                                    format="%d",
+                                ),
+
+                            "Cierre":
+                                st.column_config.NumberColumn(
+                                    "Cierre (u.)",
+                                    format="%d",
+                                ),
+                        },
+                    )
+
+                else:
+                    st.caption(
+                        "No hay detalle por producto disponible "
+                        "para esta semana."
+                    )
+
+        else:
+            st.caption(
+                "Esta semana todavía no tiene productos no-granel "
+                "registrados en cámara."
+            )
+
+        st.markdown(
             "#### 🔄 Actividad"
         )
 
@@ -6860,6 +11681,553 @@ with tab_weeks:
             hide_index=True,
             use_container_width=True,
         )
+
+        if str(
+            week.status
+        ).upper() == "OPEN":
+
+            st.divider()
+
+            st.markdown(
+                "### 🔒 Cierre de semana"
+            )
+
+            st.caption(
+                "Para cerrar la semana primero se realiza el conteo físico "
+                "final de TODAS las latas activas del salón. "
+                "Ese mismo snapshot se usa automáticamente como apertura "
+                "de la semana siguiente."
+            )
+
+            close_stock = load_current_stock()
+
+            close_salon = close_stock[
+                (
+                    close_stock[
+                        "location"
+                    ]
+                    .astype(str)
+                    .str.upper()
+                    .eq(
+                        "SALON"
+                    )
+                )
+                &
+                (
+                    close_stock[
+                        "active"
+                    ]
+                    == True
+                )
+            ].copy()
+
+            close_salon = close_salon[
+                close_salon[
+                    "estado"
+                ]
+                .astype(str)
+                .str.upper()
+                .isin(
+                    [
+                        "ABIERTA",
+                        "CERRADA",
+                    ]
+                )
+            ].copy()
+
+            if close_salon.empty:
+                st.error(
+                    "No hay latas activas ABIERTAS/CERRADAS en el salón. "
+                    "No se puede realizar el conteo final."
+                )
+
+            else:
+                close_salon[
+                    "peso_bruto_kg"
+                ] = pd.to_numeric(
+                    close_salon[
+                        "peso_actual_bruto_kg"
+                    ],
+                    errors="coerce",
+                )
+
+                close_salon[
+                    "tara_kg"
+                ] = pd.to_numeric(
+                    close_salon[
+                        "tara_actual_kg"
+                    ],
+                    errors="coerce",
+                )
+
+                # Fallback a tara inicial estimada.
+                close_salon[
+                    "tara_kg"
+                ] = (
+                    close_salon[
+                        "tara_kg"
+                    ]
+                    .fillna(
+                        pd.to_numeric(
+                            close_salon[
+                                "tara_inicial_kg"
+                            ],
+                            errors="coerce",
+                        )
+                    )
+                    .fillna(
+                        DEFAULT_TARE_KG
+                    )
+                )
+
+                close_editor_source = close_salon[
+                    [
+                        "stock_id",
+                        "sabor",
+                        "estado",
+                        "peso_bruto_kg",
+                        "tara_kg",
+                    ]
+                ].copy()
+
+                close_editor_source.insert(
+                    0,
+                    "eliminar",
+                    False,
+                )
+
+                close_editor_source = (
+                    close_editor_source
+                    .sort_values(
+                        [
+                            "estado",
+                            "sabor",
+                        ]
+                    )
+                )
+
+                st.markdown(
+                    "#### ⚖️ Reconciliación física final del salón"
+                )
+
+                st.info(
+                    "Podés corregir SABOR/ESTADO/PESO/TARA, marcar una "
+                    "lata como quitar si no está físicamente, o agregar "
+                    "una fila nueva al final si encontrás una lata que "
+                    "no figura en el sistema."
+                )
+
+                close_flavors = load_flavors()
+
+                edited_close_count = st.data_editor(
+                    close_editor_source,
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    disabled=[
+                        "stock_id",
+                    ],
+                    column_config={
+                        "eliminar":
+                            st.column_config.CheckboxColumn(
+                                "🗑️ Quitar",
+                                help=(
+                                    "Marca esta lata si figura en el sistema "
+                                    "pero no existe físicamente en el salón."
+                                ),
+                                default=False,
+                            ),
+
+                        "stock_id":
+                            st.column_config.TextColumn(
+                                "Lata",
+                                help=(
+                                    "Vacío = nueva lata encontrada durante "
+                                    "el conteo. El ID se crea al confirmar."
+                                ),
+                            ),
+
+                        "sabor":
+                            st.column_config.SelectboxColumn(
+                                "Sabor",
+                                options=
+                                    close_flavors,
+                                required=False,
+                            ),
+
+                        "estado":
+                            st.column_config.SelectboxColumn(
+                                "Estado",
+                                options=[
+                                    "ABIERTA",
+                                    "CERRADA",
+                                ],
+                                required=False,
+                            ),
+
+                        "peso_bruto_kg":
+                            st.column_config.NumberColumn(
+                                "Peso bruto",
+                                min_value=0.001,
+                                max_value=MAX_CAN_GROSS_KG,
+                                step=0.005,
+                                format="%.3f kg",
+                            ),
+
+                        "tara_kg":
+                            st.column_config.NumberColumn(
+                                "Tara",
+                                min_value=0.0,
+                                max_value=MAX_TARE_KG,
+                                step=0.005,
+                                format="%.3f kg",
+                            ),
+                    },
+                    key=
+                        f"week_close_count_editor_{week.week_id}",
+                )
+
+                # ----------------------------------------------------
+                # Preview dinámico del conteo
+                # ----------------------------------------------------
+
+                preview_close = (
+                    edited_close_count.copy()
+                )
+
+                preview_keep = preview_close[
+                    preview_close[
+                        "eliminar"
+                    ]
+                    != True
+                ].copy()
+
+                has_any_content = (
+                    preview_keep[
+                        "stock_id"
+                    ].notna()
+                    |
+                    preview_keep[
+                        "sabor"
+                    ].notna()
+                    |
+                    preview_keep[
+                        "estado"
+                    ].notna()
+                    |
+                    preview_keep[
+                        "peso_bruto_kg"
+                    ].notna()
+                    |
+                    preview_keep[
+                        "tara_kg"
+                    ].notna()
+                )
+
+                preview_keep = preview_keep[
+                    has_any_content
+                ].copy()
+
+                preview_keep[
+                    "peso_bruto_kg"
+                ] = pd.to_numeric(
+                    preview_keep[
+                        "peso_bruto_kg"
+                    ],
+                    errors="coerce",
+                )
+
+                preview_keep[
+                    "tara_kg"
+                ] = pd.to_numeric(
+                    preview_keep[
+                        "tara_kg"
+                    ],
+                    errors="coerce",
+                )
+
+                preview_keep[
+                    "peso_neto_kg"
+                ] = (
+                    preview_keep[
+                        "peso_bruto_kg"
+                    ]
+                    -
+                    preview_keep[
+                        "tara_kg"
+                    ]
+                )
+
+                valid_preview = (
+                    preview_keep[
+                        "sabor"
+                    ].notna()
+                    &
+                    preview_keep[
+                        "estado"
+                    ]
+                    .astype(str)
+                    .str.upper()
+                    .isin(
+                        [
+                            "ABIERTA",
+                            "CERRADA",
+                        ]
+                    )
+                    &
+                    preview_keep[
+                        "peso_bruto_kg"
+                    ].notna()
+                    &
+                    preview_keep[
+                        "tara_kg"
+                    ].notna()
+                    &
+                    (
+                        preview_keep[
+                            "peso_bruto_kg"
+                        ]
+                        >
+                        preview_keep[
+                            "tara_kg"
+                        ]
+                    )
+                )
+
+                invalid_close_rows = int(
+                    (
+                        ~valid_preview
+                    ).sum()
+                )
+
+                abiertas_preview = preview_keep[
+                    preview_keep[
+                        "estado"
+                    ]
+                    .astype(str)
+                    .str.upper()
+                    .eq(
+                        "ABIERTA"
+                    )
+                    &
+                    valid_preview
+                ].copy()
+
+                cerradas_preview = preview_keep[
+                    preview_keep[
+                        "estado"
+                    ]
+                    .astype(str)
+                    .str.upper()
+                    .eq(
+                        "CERRADA"
+                    )
+                    &
+                    valid_preview
+                ].copy()
+
+                abiertas_count = int(
+                    len(
+                        abiertas_preview
+                    )
+                )
+
+                cerradas_count = int(
+                    len(
+                        cerradas_preview
+                    )
+                )
+
+                abiertas_kg = round(
+                    float(
+                        abiertas_preview[
+                            "peso_neto_kg"
+                        ]
+                        .fillna(0)
+                        .sum()
+                    ),
+                    3,
+                )
+
+                cerradas_kg = round(
+                    float(
+                        cerradas_preview[
+                            "peso_neto_kg"
+                        ]
+                        .fillna(0)
+                        .sum()
+                    ),
+                    3,
+                )
+
+                final_total_kg = round(
+                    abiertas_kg
+                    + cerradas_kg,
+                    3,
+                )
+
+                st.markdown(
+                    "#### 📊 Resumen del cierre"
+                )
+
+                rc1, rc2, rc3, rc4 = st.columns(
+                    4
+                )
+
+                rc1.metric(
+                    "Latas abiertas",
+                    abiertas_count,
+                )
+
+                rc2.metric(
+                    "Kg abiertas",
+                    f"{abiertas_kg:.3f} kg",
+                )
+
+                rc3.metric(
+                    "Latas cerradas",
+                    cerradas_count,
+                )
+
+                rc4.metric(
+                    "Kg cerradas",
+                    f"{cerradas_kg:.3f} kg",
+                )
+
+                rct1, rct2 = st.columns(
+                    2
+                )
+
+                rct1.metric(
+                    "Total latas",
+                    (
+                        abiertas_count
+                        + cerradas_count
+                    ),
+                )
+
+                rct2.metric(
+                    "Stock final salón",
+                    f"{final_total_kg:.3f} kg",
+                )
+
+                if invalid_close_rows > 0:
+                    st.error(
+                        f"Hay {invalid_close_rows} fila(s) con peso/tara "
+                        "incompletos o inválidos. "
+                        "No se puede cerrar hasta corregirlas."
+                    )
+
+                st.markdown(
+                    "#### 🔁 Qué ocurrirá al confirmar"
+                )
+
+                st.write(
+                    f"1. Se guardará un conteo `CIERRE_SEMANA` "
+                    f"para **{week.week_id}**."
+                )
+
+                st.write(
+                    "2. Se congelarán las métricas de la semana actual."
+                )
+
+                st.write(
+                    "3. Se abrirá automáticamente la siguiente Week "
+                    "en el mismo timestamp."
+                )
+
+                st.write(
+                    "4. Las altas, bajas y correcciones detectadas "
+                    "reconciliarán el stock del salón y quedarán en Historial."
+                )
+
+                st.write(
+                    "5. Este mismo conteo reconciliado se copiará como "
+                    "`INICIO_SEMANA` de la nueva Week."
+                )
+
+                close_notes = st.text_input(
+                    "Observaciones del cierre",
+                    key=
+                        f"week_close_notes_{week.week_id}",
+                )
+
+                confirm_close_week = st.checkbox(
+                    (
+                        f"Confirmo el conteo y quiero cerrar "
+                        f"{week.week_id}."
+                    ),
+                    key=
+                        f"confirm_close_week_{week.week_id}",
+                )
+
+                if st.button(
+                    f"🔒 Cerrar {week.week_id} y abrir siguiente",
+                    type="primary",
+                    key=
+                        f"close_week_button_{week.week_id}",
+                    disabled=(
+                        not confirm_close_week
+                        or invalid_close_rows > 0
+                    ),
+                ):
+                    ok, result = run_ui_mutation(
+                        running_label=
+                            (
+                                f"Guardando conteo final de {week.week_id}, "
+                                "cerrando semana y creando la siguiente..."
+                            ),
+
+                        success_label=
+                            lambda result:
+                                (
+                                    f"{result['closed_week_id']} cerrada · "
+                                    f"{result['total_latas']} latas · "
+                                    f"{result['total_stock_kg']:.3f} kg · "
+                                    f"+{len(result['added_ids'])} altas · "
+                                    f"-{len(result['removed_ids'])} bajas · "
+                                    f"{len(result['corrected_ids'])} correcciones · "
+                                    f"{result['next_week_id']} abierta automáticamente."
+                                ),
+
+                        error_label=
+                            "No se pudo completar el cierre semanal.",
+
+                        operation=
+                            lambda:
+                                close_week_with_final_count(
+                                    week_id=
+                                        week.week_id,
+
+                                    edited_df=
+                                        edited_close_count,
+
+                                    notes=
+                                        close_notes,
+                                ),
+                    )
+
+                    if ok:
+                        st.success(
+                            (
+                                f"Conteo cierre: "
+                                f"{result['close_count_id']} · "
+                                f"Conteo inicio siguiente: "
+                                f"{result['next_start_count_id']}."
+                            )
+                        )
+
+                        st.rerun()
+
+        else:
+            st.success(
+                (
+                    f"🔒 {week.week_id} está cerrada desde "
+                    f"{week.closed_at}."
+                )
+            )
+
+        st.divider()
 
         st.markdown(
             "#### 🧾 Auditoría de reconstrucción"
@@ -7008,22 +12376,194 @@ with tab_config:
         type="primary",
         key="add_flavor_button",
     ):
-        try:
-            flavor, code = add_flavor(
-                new_flavor,
-                new_flavor_code,
-            )
+        ok, result = run_ui_mutation(
+            running_label=
+                "Agregando nuevo sabor al catálogo...",
 
-            st.success(
-                f"Sabor agregado: {flavor} · código {code}"
-            )
+            success_label=
+                lambda result:
+                    (
+                        f"Sabor agregado: "
+                        f"{result[0]} · código {result[1]}"
+                    ),
 
+            error_label=
+                "No se pudo agregar el sabor.",
+
+            operation=
+                lambda:
+                    add_flavor(
+                        new_flavor,
+                        new_flavor_code,
+                    ),
+        )
+
+        if ok:
             st.rerun()
 
-        except ValueError as e:
-            st.error(
-                str(e)
+
+
+
+    st.divider()
+
+    st.subheader(
+        "📦 Productos"
+    )
+
+    st.caption(
+        "Este catálogo se configura una sola vez. "
+        "Después, en Cámara, los productos aparecen en desplegables."
+    )
+
+    products_catalog_df = load_product_catalog(
+        active_only=False
+    )
+
+    if products_catalog_df.empty:
+        st.info(
+            "Todavía no hay productos configurados."
+        )
+
+    else:
+        catalog_display = products_catalog_df.copy()
+
+        st.dataframe(
+            catalog_display.sort_values(
+                [
+                    "categoria",
+                    "subcategoria",
+                    "producto",
+                ],
+                na_position="last",
+            ),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "product_code":
+                    st.column_config.TextColumn(
+                        "Código"
+                    ),
+
+                "categoria":
+                    st.column_config.TextColumn(
+                        "Categoría"
+                    ),
+
+                "subcategoria":
+                    st.column_config.TextColumn(
+                        "Subcategoría"
+                    ),
+
+                "producto":
+                    st.column_config.TextColumn(
+                        "Producto"
+                    ),
+
+                "tipo_empaque":
+                    st.column_config.TextColumn(
+                        "Empaque"
+                    ),
+
+                "unidades_por_bulto":
+                    st.column_config.NumberColumn(
+                        "Unid. x bulto",
+                        format="%d",
+                    ),
+
+                "active":
+                    st.column_config.CheckboxColumn(
+                        "Activo"
+                    ),
+            },
+        )
+
+        active_catalog = products_catalog_df[
+            products_catalog_df[
+                "active"
+            ]
+            == True
+        ].copy()
+
+        if not active_catalog.empty:
+            deactivate_map = {
+                (
+                    f"{row['product_code']} · "
+                    f"{row['producto']} · "
+                    f"{row['categoria']}"
+                ):
+                    row[
+                        "product_code"
+                    ]
+
+                for _, row in active_catalog.iterrows()
+            }
+
+            selected_deactivate_label = st.selectbox(
+                "Producto activo para desactivar",
+                options=
+                    [
+                        "—",
+                        *deactivate_map.keys(),
+                    ],
+                key="deactivate_catalog_product_select",
             )
+
+            if (
+                selected_deactivate_label
+                != "—"
+            ):
+                if st.button(
+                    "Desactivar producto",
+                    key="deactivate_catalog_product_button",
+                ):
+                    ok, product = run_ui_mutation(
+                        running_label=
+                            "Desactivando producto del catálogo...",
+
+                        success_label=
+                            lambda product:
+                                (
+                                    f"Producto desactivado · "
+                                    f"{product.product_code}"
+                                ),
+
+                        error_label=
+                            "No se pudo desactivar el producto.",
+
+                        operation=
+                            lambda:
+                                deactivate_catalog_product(
+                                    product_code=
+                                        deactivate_map[
+                                            selected_deactivate_label
+                                        ]
+                                ),
+                    )
+
+                    if ok:
+                        st.rerun()
+
+    st.markdown("### ➕ Agregar producto al catálogo")
+    st.caption("Definí una vez la estructura física. Todo termina normalizado en unidades.")
+    product_category=st.selectbox("Categoría",list(CATEGORY_CODES.keys()),key="catalog_product_category")
+    subs=CATEGORY_SUBCATEGORIES.get(product_category,[]); catalog_subcategory=st.selectbox("Subcategoría",subs,key="catalog_product_subcategory") if subs else None
+    default=PACKAGING_PACK_BOXES_UNITS if product_category in {"BOMBONES","POSTRES","PALITOS"} else (PACKAGING_PACK_UNITS if product_category in {"TENTACIONES","TORTAS","FAMILIARES"} else PACKAGING_BOX_UNITS)
+    labels={PACKAGING_PACK_BOXES_UNITS:"Pack → Cajas → Unidades",PACKAGING_PACK_UNITS:"Pack → Unidades",PACKAGING_BOX_UNITS:"Caja → Unidades"}
+    with st.form("catalog_product_form"):
+        name=st.text_input("Nombre del producto"); opts=list(labels); mode=st.selectbox("Estructura",opts,index=opts.index(default),format_func=lambda x:labels[x]); cpp=upp=upc=None
+        if mode==PACKAGING_PACK_BOXES_UNITS:
+            a,b=st.columns(2); cpp=a.number_input("Cajas por pack",1,step=1); upc=b.number_input("Unidades por caja",1,step=1)
+        elif mode==PACKAGING_PACK_UNITS:
+            unit_label="Tortas por pack" if product_category=="TORTAS" else ("Familiares por pack" if product_category=="FAMILIARES" else "Unidades por pack"); upp=st.number_input(unit_label,1,step=1)
+        else:
+            upc=st.number_input("Unidades por caja",1,step=1)
+        st.caption(f"Próximo código: {generate_product_code(product_category)}"); submit=st.form_submit_button("Agregar producto al catálogo",type="primary",use_container_width=True)
+    if submit:
+        if not name.strip(): st.error("Ingresá el nombre del producto.")
+        else:
+            ok,p=run_ui_mutation(running_label="Guardando producto...",success_label=lambda p:f"Producto guardado · {p.product_code}",error_label="No se pudo guardar.",operation=lambda:add_catalog_product(categoria=product_category,subcategoria=catalog_subcategory,producto=name,packaging_mode=mode,cajas_por_pack=cpp,unidades_por_pack=upp,unidades_por_caja=upc))
+            if ok: st.rerun()
+
 
 
 # ============================================================
