@@ -73,6 +73,68 @@ for _column in WEEK_PRODUCT_SNAPSHOT_COLUMNS:
 
 
 # ============================================================
+# WEEK SALON SNAPSHOTS
+# ============================================================
+
+WEEK_SALON_SNAPSHOT_COLUMNS = [
+    "start_salon_snapshot_json",
+    "end_salon_snapshot_json",
+]
+
+for _column in WEEK_SALON_SNAPSHOT_COLUMNS:
+    if _column not in WEEK_COLUMNS:
+        WEEK_COLUMNS.append(
+            _column
+        )
+
+
+# ============================================================
+# WEEK MERMA / NOMINAL ANALYTICS
+# ============================================================
+
+WEEK_MERMA_ANALYTICS_COLUMNS = [
+    # Cámara → Salón / peso real
+    "camera_exit_gross_kg",
+    "camera_exit_gross_avg_kg",
+    "avg_final_tare_kg",
+    "estimated_camera_exit_net_kg",
+    "estimated_net_avg_per_lata_kg",
+
+    # Comparación de las salidas de cámara contra 7.800 kg
+    "camera_nominal_expected_kg",
+    "camera_nominal_deficit_kg",
+    "camera_nominal_deficit_per_lata_kg",
+    "camera_nominal_deficit_pct",
+
+    # Universo completo analizado:
+    # cerradas al inicio + entradas desde cámara
+    "nominal_reference_kg",
+    "nominal_analyzed_latas",
+    "nominal_initial_closed_latas",
+    "nominal_camera_latas",
+    "nominal_expected_total_kg",
+    "nominal_estimated_total_kg",
+    "nominal_in_range_latas",
+    "nominal_deficit_latas",
+    "nominal_in_range_pct",
+    "nominal_deficit_total_kg",
+    "nominal_excess_total_kg",
+    "nominal_balance_total_kg",
+    "nominal_avg_deviation_kg",
+    "nominal_avg_deviation_pct",
+
+    # Derivado de la merma final cuando exista
+    "merma_latas_equivalentes",
+]
+
+for _column in WEEK_MERMA_ANALYTICS_COLUMNS:
+    if _column not in WEEK_COLUMNS:
+        WEEK_COLUMNS.append(
+            _column
+        )
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -2245,6 +2307,477 @@ def product_snapshot_units_total(
 
 
 # ============================================================
+# WEEK SALON COUNT SNAPSHOTS
+# ============================================================
+
+def _snapshot_number(
+    value,
+):
+    number = pd.to_numeric(
+        pd.Series(
+            [
+                value
+            ]
+        ),
+        errors="coerce",
+    ).iloc[0]
+
+    if pd.isna(
+        number
+    ):
+        return None
+
+    return round(
+        float(
+            number
+        ),
+        3,
+    )
+
+
+def build_salon_snapshot(
+    rows,
+    *,
+    count_id=None,
+    count_type=None,
+    timestamp=None,
+):
+    """
+    Snapshot histórico autosuficiente del salón.
+
+    Guarda una fila por lata física con:
+    stock_id, sabor, estado, bruto, tara y neto.
+
+    Acepta tanto filas de inventory_counts.csv como filas del stock vivo.
+    """
+
+    if rows is None:
+        rows = pd.DataFrame()
+
+    rows = rows.copy()
+
+    # Si recibimos el stock combinado, conservar solo el salón activo.
+    if (
+        not rows.empty
+        and "location" in rows.columns
+    ):
+        rows = rows[
+            rows[
+                "location"
+            ]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .eq(
+                "SALON"
+            )
+        ].copy()
+
+    if (
+        not rows.empty
+        and "active" in rows.columns
+    ):
+        active_mask = (
+            rows[
+                "active"
+            ]
+            .astype(str)
+            .str.strip()
+            .str.lower()
+            .isin(
+                [
+                    "true",
+                    "1",
+                    "yes",
+                ]
+            )
+        )
+
+        rows = rows[
+            active_mask
+        ].copy()
+
+    def first_value(
+        row,
+        candidates,
+    ):
+        for column in candidates:
+            if column not in row.index:
+                continue
+
+            value = row.get(
+                column
+            )
+
+            if pd.notna(
+                value
+            ):
+                return value
+
+        return None
+
+    latas = []
+
+    for _, row in rows.iterrows():
+
+        stock_id = first_value(
+            row,
+            [
+                "stock_id",
+                "salon_stock_id",
+            ],
+        )
+
+        sabor = first_value(
+            row,
+            [
+                "sabor",
+            ],
+        )
+
+        estado = first_value(
+            row,
+            [
+                "estado",
+                "estado_lata",
+            ],
+        )
+
+        bruto = _snapshot_number(
+            first_value(
+                row,
+                [
+                    "peso_bruto_kg",
+                    "peso_actual_bruto_kg",
+                    "peso_inicial_bruto_kg",
+                ],
+            )
+        )
+
+        tara = _snapshot_number(
+            first_value(
+                row,
+                [
+                    "tara_kg",
+                    "tara_actual_kg",
+                    "tara_inicial_kg",
+                ],
+            )
+        )
+
+        neto = _snapshot_number(
+            first_value(
+                row,
+                [
+                    "peso_neto_kg",
+                    "peso_actual_neto_kg",
+                    "peso_inicial_neto_kg",
+                ],
+            )
+        )
+
+        # Si neto no está persistido pero bruto/tara sí, lo derivamos.
+        if (
+            neto is None
+            and bruto is not None
+            and tara is not None
+            and bruto >= tara
+        ):
+            neto = round(
+                bruto - tara,
+                3,
+            )
+
+        latas.append(
+            {
+                "stock_id":
+                    (
+                        str(
+                            stock_id
+                        )
+                        if stock_id is not None
+                        else ""
+                    ),
+
+                "sabor":
+                    (
+                        str(
+                            sabor
+                        )
+                        if sabor is not None
+                        else ""
+                    ),
+
+                "estado":
+                    (
+                        str(
+                            estado
+                        ).upper()
+                        if estado is not None
+                        else ""
+                    ),
+
+                "peso_bruto_kg":
+                    bruto,
+
+                "tara_kg":
+                    tara,
+
+                "peso_neto_kg":
+                    neto,
+            }
+        )
+
+    latas = sorted(
+        latas,
+        key=lambda item:
+            (
+                item.get(
+                    "stock_id",
+                    ""
+                ),
+                item.get(
+                    "sabor",
+                    ""
+                ),
+            ),
+    )
+
+    abiertas = sum(
+        1
+        for lata in latas
+        if lata.get(
+            "estado"
+        ) == "ABIERTA"
+    )
+
+    cerradas = sum(
+        1
+        for lata in latas
+        if lata.get(
+            "estado"
+        ) == "CERRADA"
+    )
+
+    netos = [
+        lata[
+            "peso_neto_kg"
+        ]
+        for lata in latas
+        if lata.get(
+            "peso_neto_kg"
+        ) is not None
+    ]
+
+    total_neto = round(
+        float(
+            sum(
+                netos
+            )
+        ),
+        3,
+    )
+
+    snapshot = {
+        "count_id":
+            (
+                str(
+                    count_id
+                )
+                if count_id
+                else None
+            ),
+
+        "count_type":
+            (
+                str(
+                    count_type
+                )
+                if count_type
+                else None
+            ),
+
+        "timestamp":
+            (
+                str(
+                    timestamp
+                )
+                if timestamp
+                else None
+            ),
+
+        "totals": {
+            "latas":
+                len(
+                    latas
+                ),
+
+            "abiertas":
+                abiertas,
+
+            "cerradas":
+                cerradas,
+
+            "peso_neto_kg":
+                total_neto,
+        },
+
+        "latas":
+            latas,
+    }
+
+    return snapshot
+
+
+def salon_snapshot_to_json(
+    snapshot,
+):
+    return json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+        sort_keys=True,
+    )
+
+
+def salon_snapshot_from_json(
+    value,
+):
+    if value is None:
+        return {}
+
+    try:
+        if pd.isna(
+            value
+        ):
+            return {}
+    except Exception:
+        pass
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return value
+
+    raw = str(
+        value
+    ).strip()
+
+    if (
+        not raw
+        or raw.lower()
+        in {
+            "nan",
+            "none",
+            "<na>",
+        }
+    ):
+        return {}
+
+    try:
+        parsed = json.loads(
+            raw
+        )
+
+        return (
+            parsed
+            if isinstance(
+                parsed,
+                dict,
+            )
+            else {}
+        )
+
+    except Exception:
+        return {}
+
+
+def salon_snapshot_from_count(
+    counts_df,
+    count_id,
+):
+    if (
+        counts_df is None
+        or counts_df.empty
+        or not count_id
+        or "count_id" not in counts_df.columns
+    ):
+        return {}
+
+    count_rows = counts_df[
+        counts_df[
+            "count_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                count_id
+            )
+        )
+    ].copy()
+
+    if count_rows.empty:
+        return {}
+
+    if "location" in count_rows.columns:
+        count_rows = count_rows[
+            count_rows[
+                "location"
+            ]
+            .fillna("")
+            .astype(str)
+            .str.upper()
+            .eq(
+                "SALON"
+            )
+        ].copy()
+
+    count_type = None
+    timestamp = None
+
+    if (
+        not count_rows.empty
+        and "count_type" in count_rows.columns
+    ):
+        values = (
+            count_rows[
+                "count_type"
+            ]
+            .dropna()
+            .astype(str)
+        )
+
+        if not values.empty:
+            count_type = values.iloc[0]
+
+    if (
+        not count_rows.empty
+        and "timestamp" in count_rows.columns
+    ):
+        values = (
+            count_rows[
+                "timestamp"
+            ]
+            .dropna()
+            .astype(str)
+        )
+
+        if not values.empty:
+            timestamp = values.iloc[0]
+
+    return build_salon_snapshot(
+        count_rows,
+        count_id=count_id,
+        count_type=count_type,
+        timestamp=timestamp,
+    )
+
+
+# ============================================================
 # WEEKS
 # ============================================================
 
@@ -2289,6 +2822,10 @@ def load_weeks():
         "merma_kg",
         "merma_pct",
         "merma_no_explicada_kg",
+
+        # Merma / peso nominal persistido
+        *WEEK_MERMA_ANALYTICS_COLUMNS,
+
         "metadata_version",
     ]
 
@@ -2319,6 +2856,698 @@ def get_open_week():
         return None
 
     return opened.iloc[-1]
+
+
+def calculate_week_merma_analytics(
+    week_row,
+    movements_df,
+    counts_df,
+):
+    """
+    Calcula las métricas analíticas de una Week a partir de las fuentes
+    granulares (movimientos + conteos).
+
+    La Week persiste el resultado consolidado para que una semana histórica
+    conserve exactamente sus métricas y pueda compararse Week contra Week.
+    """
+
+    result = {
+        column: pd.NA
+        for column in WEEK_MERMA_ANALYTICS_COLUMNS
+    }
+
+    week_id = str(
+        week_row.get(
+            "week_id",
+            ""
+        )
+        or ""
+    ).strip()
+
+    if not week_id:
+        return result
+
+    # --------------------------------------------------------
+    # Movimientos de esta Week
+    # --------------------------------------------------------
+    week_movements = (
+        movements_df.copy()
+        if movements_df is not None
+        else pd.DataFrame()
+    )
+
+    if (
+        week_movements.empty
+        or "week_id" not in week_movements.columns
+    ):
+        week_movements = pd.DataFrame()
+
+    else:
+        week_movements = week_movements[
+            week_movements[
+                "week_id"
+            ]
+            .astype(str)
+            .eq(
+                week_id
+            )
+        ].copy()
+
+    movement_types = (
+        week_movements[
+            "movement_type"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.upper()
+        if (
+            not week_movements.empty
+            and "movement_type" in week_movements.columns
+        )
+        else pd.Series(
+            index=week_movements.index,
+            dtype=str,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Tara final promedio observada
+    # --------------------------------------------------------
+    avg_final_tare_kg = None
+
+    exhausted = (
+        week_movements[
+            movement_types.eq(
+                "LATA_AGOTADA"
+            )
+        ].copy()
+        if not week_movements.empty
+        else pd.DataFrame()
+    )
+
+    if (
+        not exhausted.empty
+        and "tara_final_kg" in exhausted.columns
+    ):
+        tare_values = pd.to_numeric(
+            exhausted[
+                "tara_final_kg"
+            ],
+            errors="coerce",
+        ).dropna()
+
+        if not tare_values.empty:
+            avg_final_tare_kg = float(
+                tare_values.mean()
+            )
+
+            result[
+                "avg_final_tare_kg"
+            ] = avg_final_tare_kg
+
+    # --------------------------------------------------------
+    # Salidas Cámara → Salón
+    # --------------------------------------------------------
+    camera_exits = (
+        week_movements[
+            movement_types.eq(
+                "CAMARA_A_SALON"
+            )
+        ].copy()
+        if not week_movements.empty
+        else pd.DataFrame()
+    )
+
+    gross_values = pd.Series(
+        dtype=float
+    )
+
+    if (
+        not camera_exits.empty
+        and "peso_bruto_kg" in camera_exits.columns
+    ):
+        gross_values = pd.to_numeric(
+            camera_exits[
+                "peso_bruto_kg"
+            ],
+            errors="coerce",
+        ).dropna()
+
+    camera_exit_count = int(
+        len(
+            gross_values
+        )
+    )
+
+    if camera_exit_count > 0:
+        camera_exit_gross_kg = float(
+            gross_values.sum()
+        )
+
+        camera_exit_gross_avg_kg = float(
+            gross_values.mean()
+        )
+
+        result[
+            "camera_exit_gross_kg"
+        ] = camera_exit_gross_kg
+
+        result[
+            "camera_exit_gross_avg_kg"
+        ] = camera_exit_gross_avg_kg
+
+        if avg_final_tare_kg is not None:
+            estimated_camera_exit_net_kg = max(
+                0.0,
+                camera_exit_gross_kg
+                - (
+                    camera_exit_count
+                    * avg_final_tare_kg
+                ),
+            )
+
+            estimated_net_avg_per_lata_kg = max(
+                0.0,
+                camera_exit_gross_avg_kg
+                - avg_final_tare_kg,
+            )
+
+            camera_nominal_expected_kg = (
+                camera_exit_count
+                * GRIDO_NOMINAL_NET_KG
+            )
+
+            camera_nominal_deficit_kg = (
+                estimated_camera_exit_net_kg
+                - camera_nominal_expected_kg
+            )
+
+            camera_nominal_deficit_per_lata_kg = (
+                camera_nominal_deficit_kg
+                / camera_exit_count
+            )
+
+            camera_nominal_deficit_pct = (
+                camera_nominal_deficit_kg
+                / camera_nominal_expected_kg
+                * 100.0
+                if camera_nominal_expected_kg > 0
+                else None
+            )
+
+            result.update(
+                {
+                    "estimated_camera_exit_net_kg":
+                        estimated_camera_exit_net_kg,
+
+                    "estimated_net_avg_per_lata_kg":
+                        estimated_net_avg_per_lata_kg,
+
+                    "camera_nominal_expected_kg":
+                        camera_nominal_expected_kg,
+
+                    "camera_nominal_deficit_kg":
+                        camera_nominal_deficit_kg,
+
+                    "camera_nominal_deficit_per_lata_kg":
+                        camera_nominal_deficit_per_lata_kg,
+
+                    "camera_nominal_deficit_pct":
+                        camera_nominal_deficit_pct,
+                }
+            )
+
+    # Sin tara final todavía no podemos estimar el neto nominal.
+    if avg_final_tare_kg is None:
+        return result
+
+    # --------------------------------------------------------
+    # Universo nominal:
+    # A) cerradas al inicio
+    # B) salidas desde cámara durante la Week
+    # --------------------------------------------------------
+    nominal_sources = []
+
+    start_count_id = str(
+        week_row.get(
+            "start_count_id",
+            ""
+        )
+        or ""
+    ).strip()
+
+    counts = (
+        counts_df.copy()
+        if counts_df is not None
+        else pd.DataFrame()
+    )
+
+    if (
+        start_count_id
+        and not counts.empty
+        and "count_id" in counts.columns
+    ):
+        initial_closed = counts[
+            counts[
+                "count_id"
+            ]
+            .astype(str)
+            .eq(
+                start_count_id
+            )
+        ].copy()
+
+        if "count_type" in initial_closed.columns:
+            initial_closed = initial_closed[
+                initial_closed[
+                    "count_type"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.upper()
+                .eq(
+                    "INICIO_SEMANA"
+                )
+            ].copy()
+
+        if "estado" in initial_closed.columns:
+            initial_closed = initial_closed[
+                initial_closed[
+                    "estado"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.upper()
+                .eq(
+                    "CERRADA"
+                )
+            ].copy()
+
+        if (
+            not initial_closed.empty
+            and "peso_bruto_kg" in initial_closed.columns
+        ):
+            initial_closed[
+                "peso_bruto_kg"
+            ] = pd.to_numeric(
+                initial_closed[
+                    "peso_bruto_kg"
+                ],
+                errors="coerce",
+            )
+
+            initial_closed = initial_closed[
+                initial_closed[
+                    "peso_bruto_kg"
+                ].notna()
+            ].copy()
+
+            if not initial_closed.empty:
+                nominal_sources.append(
+                    pd.DataFrame(
+                        {
+                            "analysis_stock_id":
+                                initial_closed.get(
+                                    "stock_id",
+                                    pd.Series(
+                                        index=initial_closed.index,
+                                        dtype=object,
+                                    ),
+                                ),
+
+                            "peso_bruto_kg":
+                                initial_closed[
+                                    "peso_bruto_kg"
+                                ],
+
+                            "origen":
+                                "CERRADA_INICIO",
+                        }
+                    )
+                )
+
+    if (
+        not camera_exits.empty
+        and "peso_bruto_kg" in camera_exits.columns
+    ):
+        camera_nominal = camera_exits.copy()
+
+        camera_nominal[
+            "peso_bruto_kg"
+        ] = pd.to_numeric(
+            camera_nominal[
+                "peso_bruto_kg"
+            ],
+            errors="coerce",
+        )
+
+        camera_nominal = camera_nominal[
+            camera_nominal[
+                "peso_bruto_kg"
+            ].notna()
+        ].copy()
+
+        if not camera_nominal.empty:
+            if "target_stock_id" in camera_nominal.columns:
+                analysis_ids = (
+                    camera_nominal[
+                        "target_stock_id"
+                    ]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                )
+
+                if "source_stock_id" in camera_nominal.columns:
+                    source_ids = (
+                        camera_nominal[
+                            "source_stock_id"
+                        ]
+                        .fillna("")
+                        .astype(str)
+                        .str.strip()
+                    )
+
+                    analysis_ids = analysis_ids.where(
+                        analysis_ids.ne(""),
+                        source_ids,
+                    )
+
+            elif "source_stock_id" in camera_nominal.columns:
+                analysis_ids = (
+                    camera_nominal[
+                        "source_stock_id"
+                    ]
+                    .fillna("")
+                    .astype(str)
+                    .str.strip()
+                )
+
+            else:
+                analysis_ids = pd.Series(
+                    [
+                        f"CAMERA_EXIT_{i}"
+                        for i in range(
+                            len(
+                                camera_nominal
+                            )
+                        )
+                    ],
+                    index=camera_nominal.index,
+                )
+
+            nominal_sources.append(
+                pd.DataFrame(
+                    {
+                        "analysis_stock_id":
+                            analysis_ids,
+
+                        "peso_bruto_kg":
+                            camera_nominal[
+                                "peso_bruto_kg"
+                            ],
+
+                        "origen":
+                            "DESDE_CAMARA",
+                    }
+                )
+            )
+
+    if not nominal_sources:
+        return result
+
+    nominal = pd.concat(
+        nominal_sources,
+        ignore_index=True,
+    )
+
+    nominal[
+        "analysis_stock_id"
+    ] = (
+        nominal[
+            "analysis_stock_id"
+        ]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    # Deduplicación solamente cuando tenemos un ID físico confiable.
+    with_id = nominal[
+        nominal[
+            "analysis_stock_id"
+        ].ne("")
+    ].drop_duplicates(
+        subset=[
+            "analysis_stock_id"
+        ],
+        keep="first",
+    )
+
+    without_id = nominal[
+        nominal[
+            "analysis_stock_id"
+        ].eq("")
+    ]
+
+    nominal = pd.concat(
+        [
+            with_id,
+            without_id,
+        ],
+        ignore_index=True,
+    )
+
+    if nominal.empty:
+        return result
+
+    nominal[
+        "neto_estimado_kg"
+    ] = (
+        nominal[
+            "peso_bruto_kg"
+        ]
+        - avg_final_tare_kg
+    )
+
+    nominal[
+        "desvio_vs_nominal_kg"
+    ] = (
+        nominal[
+            "neto_estimado_kg"
+        ]
+        - GRIDO_NOMINAL_NET_KG
+    )
+
+    nominal[
+        "estado_nominal"
+    ] = nominal[
+        "desvio_vs_nominal_kg"
+    ].apply(
+        lambda value:
+            "EXCEDENTE"
+            if value > GRIDO_NOMINAL_TOLERANCE_KG
+            else (
+                "DEFICIT"
+                if value < -GRIDO_NOMINAL_TOLERANCE_KG
+                else "EN_RANGO"
+            )
+    )
+
+    analyzed_count = int(
+        len(
+            nominal
+        )
+    )
+
+    initial_count = int(
+        (
+            nominal[
+                "origen"
+            ]
+            == "CERRADA_INICIO"
+        ).sum()
+    )
+
+    from_camera_count = int(
+        (
+            nominal[
+                "origen"
+            ]
+            == "DESDE_CAMARA"
+        ).sum()
+    )
+
+    in_range_count = int(
+        nominal[
+            "estado_nominal"
+        ]
+        .isin(
+            [
+                "EN_RANGO",
+                "EXCEDENTE",
+            ]
+        )
+        .sum()
+    )
+
+    deficit_count = int(
+        (
+            nominal[
+                "estado_nominal"
+            ]
+            == "DEFICIT"
+        ).sum()
+    )
+
+    deviations = nominal[
+        "desvio_vs_nominal_kg"
+    ]
+
+    deficits = deviations[
+        deviations < 0
+    ]
+
+    excesses = deviations[
+        deviations > 0
+    ]
+
+    nominal_expected_total_kg = (
+        analyzed_count
+        * GRIDO_NOMINAL_NET_KG
+    )
+
+    nominal_estimated_total_kg = float(
+        nominal[
+            "neto_estimado_kg"
+        ].sum()
+    )
+
+    nominal_deficit_total_kg = (
+        float(
+            -deficits.sum()
+        )
+        if not deficits.empty
+        else 0.0
+    )
+
+    nominal_excess_total_kg = (
+        float(
+            excesses.sum()
+        )
+        if not excesses.empty
+        else 0.0
+    )
+
+    nominal_balance_total_kg = float(
+        deviations.sum()
+    )
+
+    nominal_avg_deviation_kg = float(
+        deviations.mean()
+    )
+
+    nominal_avg_deviation_pct = (
+        nominal_avg_deviation_kg
+        / GRIDO_NOMINAL_NET_KG
+        * 100.0
+    )
+
+    nominal_in_range_pct = (
+        in_range_count
+        / analyzed_count
+        * 100.0
+        if analyzed_count > 0
+        else None
+    )
+
+    result.update(
+        {
+            "nominal_reference_kg":
+                GRIDO_NOMINAL_NET_KG,
+
+            "nominal_analyzed_latas":
+                analyzed_count,
+
+            "nominal_initial_closed_latas":
+                initial_count,
+
+            "nominal_camera_latas":
+                from_camera_count,
+
+            "nominal_expected_total_kg":
+                nominal_expected_total_kg,
+
+            "nominal_estimated_total_kg":
+                nominal_estimated_total_kg,
+
+            "nominal_in_range_latas":
+                in_range_count,
+
+            "nominal_deficit_latas":
+                deficit_count,
+
+            "nominal_in_range_pct":
+                nominal_in_range_pct,
+
+            "nominal_deficit_total_kg":
+                nominal_deficit_total_kg,
+
+            "nominal_excess_total_kg":
+                nominal_excess_total_kg,
+
+            "nominal_balance_total_kg":
+                nominal_balance_total_kg,
+
+            "nominal_avg_deviation_kg":
+                nominal_avg_deviation_kg,
+
+            "nominal_avg_deviation_pct":
+                nominal_avg_deviation_pct,
+        }
+    )
+
+    # Si la Week ya tiene merma final calculada, traducimos a latas equivalentes.
+    merma_value = pd.to_numeric(
+        pd.Series(
+            [
+                week_row.get(
+                    "merma_kg",
+                    pd.NA,
+                )
+            ]
+        ),
+        errors="coerce",
+    ).iloc[0]
+
+    estimated_avg = result.get(
+        "estimated_net_avg_per_lata_kg",
+        pd.NA,
+    )
+
+    if (
+        pd.notna(
+            merma_value
+        )
+        and pd.notna(
+            estimated_avg
+        )
+        and float(
+            estimated_avg
+        ) > 0
+    ):
+        result[
+            "merma_latas_equivalentes"
+        ] = (
+            float(
+                merma_value
+            )
+            / float(
+                estimated_avg
+            )
+        )
+
+    return result
 
 
 def refresh_all_metadata(
@@ -2392,6 +3621,139 @@ def refresh_all_metadata(
             now_iso=now_iso(),
         )
     )
+
+    # --------------------------------------------------------
+    # Persisted Week merma / nominal analytics
+    # --------------------------------------------------------
+
+    for analytics_column in WEEK_MERMA_ANALYTICS_COLUMNS:
+        if analytics_column not in refreshed_weeks.columns:
+            refreshed_weeks[
+                analytics_column
+            ] = pd.NA
+
+    for idx, refreshed_row in refreshed_weeks.iterrows():
+        analytics = calculate_week_merma_analytics(
+            refreshed_row,
+            movements_df=movements,
+            counts_df=counts,
+        )
+
+        for column, value in analytics.items():
+            refreshed_weeks.loc[
+                idx,
+                column,
+            ] = value
+
+    # --------------------------------------------------------
+    # Salon start/end snapshots
+    # --------------------------------------------------------
+    # Son snapshots históricos congelados. Nunca se reconstruyen desde
+    # el stock actual si ya existen. Para Weeks antiguas, si faltan,
+    # se backfillean desde start_count_id / end_count_id.
+    # --------------------------------------------------------
+
+    for snapshot_column in WEEK_SALON_SNAPSHOT_COLUMNS:
+        if snapshot_column not in refreshed_weeks.columns:
+            refreshed_weeks[
+                snapshot_column
+            ] = pd.NA
+
+    existing_salon_snapshots = {}
+
+    if not weeks.empty:
+        for _, existing_week in weeks.iterrows():
+            existing_salon_snapshots[
+                str(
+                    existing_week.get(
+                        "week_id",
+                        ""
+                    )
+                )
+            ] = {
+                "start":
+                    existing_week.get(
+                        "start_salon_snapshot_json",
+                        pd.NA,
+                    ),
+
+                "end":
+                    existing_week.get(
+                        "end_salon_snapshot_json",
+                        pd.NA,
+                    ),
+            }
+
+    for idx, refreshed_row in refreshed_weeks.iterrows():
+        week_id = str(
+            refreshed_row.get(
+                "week_id",
+                ""
+            )
+        )
+
+        existing = existing_salon_snapshots.get(
+            week_id,
+            {},
+        )
+
+        existing_start = existing.get(
+            "start",
+            pd.NA,
+        )
+
+        existing_end = existing.get(
+            "end",
+            pd.NA,
+        )
+
+        if pd.notna(
+            existing_start
+        ):
+            refreshed_weeks.loc[
+                idx,
+                "start_salon_snapshot_json",
+            ] = existing_start
+
+        else:
+            start_snapshot = salon_snapshot_from_count(
+                counts,
+                refreshed_row.get(
+                    "start_count_id"
+                ),
+            )
+
+            if start_snapshot:
+                refreshed_weeks.loc[
+                    idx,
+                    "start_salon_snapshot_json",
+                ] = salon_snapshot_to_json(
+                    start_snapshot
+                )
+
+        if pd.notna(
+            existing_end
+        ):
+            refreshed_weeks.loc[
+                idx,
+                "end_salon_snapshot_json",
+            ] = existing_end
+
+        else:
+            end_snapshot = salon_snapshot_from_count(
+                counts,
+                refreshed_row.get(
+                    "end_count_id"
+                ),
+            )
+
+            if end_snapshot:
+                refreshed_weeks.loc[
+                    idx,
+                    "end_salon_snapshot_json",
+                ] = salon_snapshot_to_json(
+                    end_snapshot
+                )
 
     # --------------------------------------------------------
     # Product snapshots are owned by the app because they come
@@ -2581,6 +3943,17 @@ def create_week(
         )
     )
 
+    start_salon_snapshot_json = (
+        salon_snapshot_to_json(
+            build_salon_snapshot(
+                stock,
+                count_id=start_count_id,
+                count_type="INICIO_SEMANA",
+                timestamp=timestamp,
+            )
+        )
+    )
+
     row = {
         column:
             pd.NA
@@ -2669,6 +4042,12 @@ def create_week(
 
             "start_camera_snapshot_source":
                 "LIVE_START_SNAPSHOT",
+
+            "start_salon_snapshot_json":
+                start_salon_snapshot_json,
+
+            "end_salon_snapshot_json":
+                pd.NA,
 
             "start_products_snapshot_json":
                 products_snapshot_json,
@@ -2854,6 +4233,17 @@ def close_week(
         3,
     )
 
+    end_salon_snapshot_json = (
+        salon_snapshot_to_json(
+            build_salon_snapshot(
+                final_count_rows,
+                count_id=end_count_id,
+                count_type="CIERRE_SEMANA",
+                timestamp=timestamp,
+            )
+        )
+    )
+
     # --------------------------------------------------------
     # Congelar Week
     # --------------------------------------------------------
@@ -2948,6 +4338,11 @@ def close_week(
 
     # Conservamos estos valores para que week_service considere la Week
     # un snapshot histórico congelado.
+    refreshed_weeks.loc[
+        idx,
+        "end_salon_snapshot_json"
+    ] = end_salon_snapshot_json
+
     refreshed_weeks.loc[
         idx,
         "end_salon_snapshot_source"
@@ -10925,21 +12320,47 @@ with tab_weeks:
             "status",
             "started_at",
             "closed_at",
+
+            # Inventario / actividad
             "start_salon_kg",
             "start_camera_latas",
             "start_camera_kg",
             "camera_to_salon_latas",
-            "camera_to_salon_kg",
             "cambios_sabor",
             "latas_terminadas",
             "latas_abiertas",
-            "recambios",
             "latas_con_tara_final",
             "tara_final_total_kg",
-            "residuo_estimado_kg",
+
+            # Peso real / nominal de las latas
+            "camera_exit_gross_kg",
+            "avg_final_tare_kg",
+            "estimated_camera_exit_net_kg",
+            "camera_nominal_expected_kg",
+            "camera_nominal_deficit_kg",
+            "camera_nominal_deficit_pct",
+
+            # Universo nominal completo de la Week
+            "nominal_analyzed_latas",
+            "nominal_initial_closed_latas",
+            "nominal_camera_latas",
+            "nominal_in_range_latas",
+            "nominal_deficit_latas",
+            "nominal_in_range_pct",
+            "nominal_deficit_total_kg",
+            "nominal_excess_total_kg",
+            "nominal_balance_total_kg",
+            "nominal_avg_deviation_kg",
+            "nominal_avg_deviation_pct",
+
+            # Estado / merma
             "current_salon_kg",
             "current_camera_latas",
             "consumo_fisico_kg",
+            "consumo_teorico_kg",
+            "merma_kg",
+            "merma_pct",
+            "merma_latas_equivalentes",
         ]
 
         visible_columns = [
@@ -11005,10 +12426,10 @@ with tab_weeks:
                         format="%.3f kg",
                     ),
 
-                "camera_to_salon_kg":
+                "camera_to_salon_latas":
                     st.column_config.NumberColumn(
-                        "Kg cámara → salón",
-                        format="%.3f kg",
+                        "Cámara → salón",
+                        format="%d latas",
                     ),
 
                 "tara_final_total_kg":
@@ -11017,10 +12438,106 @@ with tab_weeks:
                         format="%.3f kg",
                     ),
 
-                "residuo_estimado_kg":
+                "camera_exit_gross_kg":
                     st.column_config.NumberColumn(
-                        "Residuo estimado",
+                        "Bruto desde cámara",
                         format="%.3f kg",
+                    ),
+
+                "avg_final_tare_kg":
+                    st.column_config.NumberColumn(
+                        "Tara prom.",
+                        format="%.3f kg",
+                    ),
+
+                "estimated_camera_exit_net_kg":
+                    st.column_config.NumberColumn(
+                        "Neto est. cámara",
+                        format="%.3f kg",
+                    ),
+
+                "camera_nominal_expected_kg":
+                    st.column_config.NumberColumn(
+                        "Nominal esperado cámara",
+                        format="%.3f kg",
+                    ),
+
+                "camera_nominal_deficit_kg":
+                    st.column_config.NumberColumn(
+                        "Déficit cámara",
+                        format="%+.3f kg",
+                    ),
+
+                "camera_nominal_deficit_pct":
+                    st.column_config.NumberColumn(
+                        "Déficit cámara %",
+                        format="%+.2f%%",
+                    ),
+
+                "nominal_analyzed_latas":
+                    st.column_config.NumberColumn(
+                        "Latas analizadas",
+                        format="%d",
+                    ),
+
+                "nominal_initial_closed_latas":
+                    st.column_config.NumberColumn(
+                        "Cerradas inicio",
+                        format="%d",
+                    ),
+
+                "nominal_camera_latas":
+                    st.column_config.NumberColumn(
+                        "Desde cámara",
+                        format="%d",
+                    ),
+
+                "nominal_in_range_latas":
+                    st.column_config.NumberColumn(
+                        "En rango o mejor",
+                        format="%d",
+                    ),
+
+                "nominal_deficit_latas":
+                    st.column_config.NumberColumn(
+                        "Déficit claro",
+                        format="%d",
+                    ),
+
+                "nominal_in_range_pct":
+                    st.column_config.NumberColumn(
+                        "% en rango o mejor",
+                        format="%.1f%%",
+                    ),
+
+                "nominal_deficit_total_kg":
+                    st.column_config.NumberColumn(
+                        "Déficit total",
+                        format="%.3f kg",
+                    ),
+
+                "nominal_excess_total_kg":
+                    st.column_config.NumberColumn(
+                        "Excedente total",
+                        format="%.3f kg",
+                    ),
+
+                "nominal_balance_total_kg":
+                    st.column_config.NumberColumn(
+                        "Balance vs nominal",
+                        format="%+.3f kg",
+                    ),
+
+                "nominal_avg_deviation_kg":
+                    st.column_config.NumberColumn(
+                        "Desvío prom. vs 7.800",
+                        format="%+.3f kg",
+                    ),
+
+                "nominal_avg_deviation_pct":
+                    st.column_config.NumberColumn(
+                        "Desvío prom. %",
+                        format="%+.2f%%",
                     ),
 
                 "current_salon_kg":
@@ -11033,6 +12550,30 @@ with tab_weeks:
                     st.column_config.NumberColumn(
                         "Consumo físico",
                         format="%.3f kg",
+                    ),
+
+                "consumo_teorico_kg":
+                    st.column_config.NumberColumn(
+                        "Consumo teórico",
+                        format="%.3f kg",
+                    ),
+
+                "merma_kg":
+                    st.column_config.NumberColumn(
+                        "Merma",
+                        format="%+.3f kg",
+                    ),
+
+                "merma_pct":
+                    st.column_config.NumberColumn(
+                        "Merma %",
+                        format="%+.2f%%",
+                    ),
+
+                "merma_latas_equivalentes":
+                    st.column_config.NumberColumn(
+                        "Latas eq. merma",
+                        format="%.2f",
                     ),
             },
         )
@@ -11127,6 +12668,1306 @@ with tab_weeks:
         )
 
         st.markdown(
+            "#### ⚖️ Análisis de peso y cumplimiento nominal"
+        )
+
+        def _week_num(
+            column,
+        ):
+            value = pd.to_numeric(
+                pd.Series(
+                    [
+                        selected_week_row.get(
+                            column,
+                            pd.NA,
+                        )
+                    ]
+                ),
+                errors="coerce",
+            ).iloc[0]
+
+            return (
+                float(value)
+                if pd.notna(value)
+                else None
+            )
+
+        wa1, wa2, wa3, wa4 = st.columns(4)
+
+        _gross = _week_num(
+            "camera_exit_gross_kg"
+        )
+        _tare = _week_num(
+            "avg_final_tare_kg"
+        )
+        _net = _week_num(
+            "estimated_camera_exit_net_kg"
+        )
+        _camera_deficit = _week_num(
+            "camera_nominal_deficit_kg"
+        )
+
+        wa1.metric(
+            "Kg brutos desde cámara",
+            (
+                f"{_gross:.3f} kg"
+                if _gross is not None
+                else "-"
+            ),
+        )
+
+        wa2.metric(
+            "Prom. tara final",
+            (
+                f"{_tare:.3f} kg"
+                if _tare is not None
+                else "-"
+            ),
+        )
+
+        wa3.metric(
+            "Kg netos estimados",
+            (
+                f"{_net:.3f} kg"
+                if _net is not None
+                else "-"
+            ),
+        )
+
+        wa4.metric(
+            "Déficit cámara vs nominal",
+            (
+                f"{_camera_deficit:+.3f} kg"
+                if _camera_deficit is not None
+                else "-"
+            ),
+        )
+
+        # ----------------------------------------------------
+        # Fuente usada para los kg Cámara → Salón del consumo físico
+        # ----------------------------------------------------
+        # Reproducimos la misma condición de week_service:
+        # si hay bruto válido en CAMARA_A_SALON y tara final válida
+        # en la Week, el consumo usa bruto - tara promedio.
+        # En caso contrario usa el peso_neto_kg histórico del movimiento.
+        selected_week_id = str(
+            selected_week_row.get(
+                "week_id",
+                ""
+            )
+            or ""
+        )
+
+        source_label = "MOVEMENT_NET_FALLBACK"
+
+        try:
+            _week_movs = movements.copy()
+
+            if (
+                not _week_movs.empty
+                and "week_id" in _week_movs.columns
+                and "movement_type" in _week_movs.columns
+            ):
+                _week_movs = _week_movs[
+                    _week_movs["week_id"]
+                    .astype(str)
+                    .eq(selected_week_id)
+                ].copy()
+
+                _types = (
+                    _week_movs["movement_type"]
+                    .fillna("")
+                    .astype(str)
+                    .str.upper()
+                )
+
+                _camera_rows = _week_movs[
+                    _types.eq("CAMARA_A_SALON")
+                ].copy()
+
+                _exhausted_rows = _week_movs[
+                    _types.eq("LATA_AGOTADA")
+                ].copy()
+
+                _gross_ok = (
+                    "peso_bruto_kg" in _camera_rows.columns
+                    and not pd.to_numeric(
+                        _camera_rows["peso_bruto_kg"],
+                        errors="coerce",
+                    ).dropna().empty
+                )
+
+                _tare_ok = (
+                    "tara_final_kg" in _exhausted_rows.columns
+                    and not pd.to_numeric(
+                        _exhausted_rows["tara_final_kg"],
+                        errors="coerce",
+                    ).dropna().empty
+                )
+
+                if _gross_ok and _tare_ok:
+                    source_label = "GROSS_MINUS_WEEK_AVG_FINAL_TARE"
+
+        except Exception:
+            source_label = "MOVEMENT_NET_FALLBACK"
+
+        source_friendly = (
+            "Bruto − tara prom. semanal"
+            if source_label == "GROSS_MINUS_WEEK_AVG_FINAL_TARE"
+            else "Neto guardado en movimientos (fallback)"
+        )
+
+        st.metric(
+            "Fuente kg Cámara → Salón usada en consumo físico",
+            source_friendly,
+            help=(
+                f"Fuente técnica: {source_label}. "
+                "Si existen pesos brutos válidos de las salidas de cámara "
+                "y una tara final promedio válida de la Week, se usa "
+                "Σ bruto − (cantidad de latas × tara promedio semanal). "
+                "Si faltan esos datos, se usa el peso_neto_kg histórico "
+                "de los movimientos CAMARA_A_SALON."
+            ),
+        )
+
+        # ====================================================
+        # AUDITORÍA DEL CONSUMO FÍSICO
+        # ====================================================
+        if str(
+            selected_week_row.get(
+                "status",
+                ""
+            )
+        ).upper() == "CLOSED":
+
+            with st.expander(
+                "🧾 Ver detalle exacto del cálculo de consumo físico",
+                expanded=False,
+            ):
+                st.caption(
+                    "Esta tabla muestra cada componente que entra en la "
+                    "ecuación de consumo físico. Las filas de INICIO y "
+                    "ENTRADA suman; las filas de CIERRE restan."
+                )
+
+                audit_rows = []
+
+                # --------------------------------------------
+                # 1) Snapshot inicial: suma
+                # --------------------------------------------
+                start_snapshot_audit = salon_snapshot_from_json(
+                    selected_week_row.get(
+                        "start_salon_snapshot_json"
+                    )
+                )
+
+                for lata in start_snapshot_audit.get(
+                    "latas",
+                    []
+                ):
+                    neto = pd.to_numeric(
+                        pd.Series(
+                            [
+                                lata.get(
+                                    "peso_neto_kg"
+                                )
+                            ]
+                        ),
+                        errors="coerce",
+                    ).iloc[0]
+
+                    if pd.isna(
+                        neto
+                    ):
+                        continue
+
+                    audit_rows.append(
+                        {
+                            "Tipo": "INICIO",
+                            "ID salón": lata.get(
+                                "stock_id",
+                                "",
+                            ),
+                            "ID cámara": "",
+                            "Sabor": lata.get(
+                                "sabor",
+                                "",
+                            ),
+                            "Estado": lata.get(
+                                "estado",
+                                "",
+                            ),
+                            "Bruto kg": lata.get(
+                                "peso_bruto_kg"
+                            ),
+                            "Tara aplicada kg": lata.get(
+                                "tara_kg"
+                            ),
+                            "Neto usado kg": float(
+                                neto
+                            ),
+                            "Impacto consumo kg": float(
+                                neto
+                            ),
+                            "Criterio": "Conteo inicial",
+                        }
+                    )
+
+                # --------------------------------------------
+                # 2) Movimientos de la ventana real de la Week
+                # --------------------------------------------
+                audit_movements = load_csv(
+                    MOVEMENTS_FILE
+                )
+
+                if not audit_movements.empty:
+                    audit_movements[
+                        "_timestamp_dt"
+                    ] = pd.to_datetime(
+                        audit_movements[
+                            "timestamp"
+                        ],
+                        errors="coerce",
+                        utc=True,
+                    )
+
+                    audit_start = pd.to_datetime(
+                        selected_week_row.get(
+                            "started_at"
+                        ),
+                        errors="coerce",
+                        utc=True,
+                    )
+
+                    audit_end = pd.to_datetime(
+                        selected_week_row.get(
+                            "closed_at"
+                        ),
+                        errors="coerce",
+                        utc=True,
+                    )
+
+                    if pd.notna(
+                        audit_start
+                    ):
+                        audit_movements = audit_movements[
+                            audit_movements[
+                                "_timestamp_dt"
+                            ]
+                            >= audit_start
+                        ].copy()
+
+                    if pd.notna(
+                        audit_end
+                    ):
+                        audit_movements = audit_movements[
+                            audit_movements[
+                                "_timestamp_dt"
+                            ]
+                            <= audit_end
+                        ].copy()
+
+                    audit_types = (
+                        audit_movements[
+                            "movement_type"
+                        ]
+                        .fillna("")
+                        .astype(str)
+                        .str.upper()
+                    )
+
+                    audit_camera = audit_movements[
+                        audit_types.eq(
+                            "CAMARA_A_SALON"
+                        )
+                    ].copy()
+
+                    audit_exhausted = audit_movements[
+                        audit_types.eq(
+                            "LATA_AGOTADA"
+                        )
+                    ].copy()
+
+                    audit_manual = audit_movements[
+                        audit_types.eq(
+                            "CARGA_MANUAL_SALON"
+                        )
+                    ].copy()
+
+                    audit_tare_values = pd.to_numeric(
+                        audit_exhausted.get(
+                            "tara_final_kg",
+                            pd.Series(
+                                index=audit_exhausted.index,
+                                dtype=float,
+                            ),
+                        ),
+                        errors="coerce",
+                    ).dropna()
+
+                    audit_avg_tare = (
+                        float(
+                            audit_tare_values.mean()
+                        )
+                        if not audit_tare_values.empty
+                        else None
+                    )
+
+                    # ----------------------------------------
+                    # Cámara → Salón: suma
+                    # ----------------------------------------
+                    for _, movement in audit_camera.iterrows():
+                        gross = pd.to_numeric(
+                            movement.get(
+                                "peso_bruto_kg"
+                            ),
+                            errors="coerce",
+                        )
+
+                        stored_net = pd.to_numeric(
+                            movement.get(
+                                "peso_neto_kg"
+                            ),
+                            errors="coerce",
+                        )
+
+                        if (
+                            source_label
+                            == "GROSS_MINUS_WEEK_AVG_FINAL_TARE"
+                        ):
+                            if (
+                                pd.isna(
+                                    gross
+                                )
+                                or audit_avg_tare is None
+                            ):
+                                # Igual que week_service: una fila sin bruto
+                                # no forma parte del gross_values usado.
+                                continue
+
+                            net_used = max(
+                                0.0,
+                                float(
+                                    gross
+                                )
+                                - audit_avg_tare,
+                            )
+
+                            tare_used = audit_avg_tare
+                            criterio = "Bruto − tara prom. Week"
+
+                        else:
+                            if pd.isna(
+                                stored_net
+                            ):
+                                continue
+
+                            net_used = float(
+                                stored_net
+                            )
+
+                            tare_used = pd.to_numeric(
+                                movement.get(
+                                    "tara_kg"
+                                ),
+                                errors="coerce",
+                            )
+
+                            criterio = "Neto guardado (fallback)"
+
+                        salon_id = str(
+                            movement.get(
+                                "target_stock_id",
+                                ""
+                            )
+                            or ""
+                        ).strip()
+
+                        camera_id = str(
+                            movement.get(
+                                "source_stock_id",
+                                ""
+                            )
+                            or ""
+                        ).strip()
+
+                        audit_rows.append(
+                            {
+                                "Tipo": "ENTRADA CÁMARA",
+                                "ID salón": salon_id,
+                                "ID cámara": camera_id,
+                                "Sabor": movement.get(
+                                    "sabor",
+                                    "",
+                                ),
+                                "Estado": "",
+                                "Bruto kg": (
+                                    float(
+                                        gross
+                                    )
+                                    if pd.notna(
+                                        gross
+                                    )
+                                    else None
+                                ),
+                                "Tara aplicada kg": (
+                                    float(
+                                        tare_used
+                                    )
+                                    if pd.notna(
+                                        tare_used
+                                    )
+                                    else None
+                                ),
+                                "Neto usado kg": round(
+                                    net_used,
+                                    3,
+                                ),
+                                "Impacto consumo kg": round(
+                                    net_used,
+                                    3,
+                                ),
+                                "Criterio": criterio,
+                            }
+                        )
+
+                    # ----------------------------------------
+                    # Cargas manuales: suma
+                    # ----------------------------------------
+                    for _, movement in audit_manual.iterrows():
+                        net_used = pd.to_numeric(
+                            movement.get(
+                                "peso_neto_kg"
+                            ),
+                            errors="coerce",
+                        )
+
+                        if pd.isna(
+                            net_used
+                        ):
+                            continue
+
+                        audit_rows.append(
+                            {
+                                "Tipo": "CARGA MANUAL",
+                                "ID salón": str(
+                                    movement.get(
+                                        "target_stock_id",
+                                        ""
+                                    )
+                                    or ""
+                                ),
+                                "ID cámara": "",
+                                "Sabor": movement.get(
+                                    "sabor",
+                                    "",
+                                ),
+                                "Estado": "",
+                                "Bruto kg": movement.get(
+                                    "peso_bruto_kg"
+                                ),
+                                "Tara aplicada kg": movement.get(
+                                    "tara_kg"
+                                ),
+                                "Neto usado kg": float(
+                                    net_used
+                                ),
+                                "Impacto consumo kg": float(
+                                    net_used
+                                ),
+                                "Criterio": "Carga manual",
+                            }
+                        )
+
+                # --------------------------------------------
+                # 3) Snapshot final: resta
+                # --------------------------------------------
+                end_snapshot_audit = salon_snapshot_from_json(
+                    selected_week_row.get(
+                        "end_salon_snapshot_json"
+                    )
+                )
+
+                for lata in end_snapshot_audit.get(
+                    "latas",
+                    []
+                ):
+                    neto = pd.to_numeric(
+                        pd.Series(
+                            [
+                                lata.get(
+                                    "peso_neto_kg"
+                                )
+                            ]
+                        ),
+                        errors="coerce",
+                    ).iloc[0]
+
+                    if pd.isna(
+                        neto
+                    ):
+                        continue
+
+                    audit_rows.append(
+                        {
+                            "Tipo": "CIERRE",
+                            "ID salón": lata.get(
+                                "stock_id",
+                                "",
+                            ),
+                            "ID cámara": "",
+                            "Sabor": lata.get(
+                                "sabor",
+                                "",
+                            ),
+                            "Estado": lata.get(
+                                "estado",
+                                "",
+                            ),
+                            "Bruto kg": lata.get(
+                                "peso_bruto_kg"
+                            ),
+                            "Tara aplicada kg": lata.get(
+                                "tara_kg"
+                            ),
+                            "Neto usado kg": float(
+                                neto
+                            ),
+                            "Impacto consumo kg": -float(
+                                neto
+                            ),
+                            "Criterio": "Conteo final",
+                        }
+                    )
+
+                # --------------------------------------------
+                # Resumen de la ecuación
+                # --------------------------------------------
+                audit_df = pd.DataFrame(
+                    audit_rows
+                )
+
+                if audit_df.empty:
+                    st.info(
+                        "No hay datos suficientes para reconstruir "
+                        "el detalle del consumo físico."
+                    )
+
+                else:
+                    start_component = float(
+                        audit_df.loc[
+                            audit_df[
+                                "Tipo"
+                            ].eq(
+                                "INICIO"
+                            ),
+                            "Impacto consumo kg",
+                        ].sum()
+                    )
+
+                    camera_component = float(
+                        audit_df.loc[
+                            audit_df[
+                                "Tipo"
+                            ].eq(
+                                "ENTRADA CÁMARA"
+                            ),
+                            "Impacto consumo kg",
+                        ].sum()
+                    )
+
+                    manual_component = float(
+                        audit_df.loc[
+                            audit_df[
+                                "Tipo"
+                            ].eq(
+                                "CARGA MANUAL"
+                            ),
+                            "Impacto consumo kg",
+                        ].sum()
+                    )
+
+                    end_component = abs(
+                        float(
+                            audit_df.loc[
+                                audit_df[
+                                    "Tipo"
+                                ].eq(
+                                    "CIERRE"
+                                ),
+                                "Impacto consumo kg",
+                            ].sum()
+                        )
+                    )
+
+                    reconstructed_consumption = round(
+                        float(
+                            audit_df[
+                                "Impacto consumo kg"
+                            ].sum()
+                        ),
+                        3,
+                    )
+
+                    stored_consumption = pd.to_numeric(
+                        selected_week_row.get(
+                            "consumo_fisico_kg"
+                        ),
+                        errors="coerce",
+                    )
+
+                    equation_difference = (
+                        round(
+                            reconstructed_consumption
+                            - float(
+                                stored_consumption
+                            ),
+                            3,
+                        )
+                        if pd.notna(
+                            stored_consumption
+                        )
+                        else None
+                    )
+
+                    eq1, eq2, eq3, eq4, eq5 = st.columns(
+                        5
+                    )
+
+                    eq1.metric(
+                        "Salón inicial",
+                        f"{start_component:.3f} kg",
+                    )
+
+                    eq2.metric(
+                        "+ Neto desde cámara",
+                        f"{camera_component:.3f} kg",
+                    )
+
+                    eq3.metric(
+                        "+ Cargas manuales",
+                        f"{manual_component:.3f} kg",
+                    )
+
+                    eq4.metric(
+                        "− Salón al cierre",
+                        f"{end_component:.3f} kg",
+                    )
+
+                    eq5.metric(
+                        "= Consumo físico",
+                        f"{reconstructed_consumption:.3f} kg",
+                    )
+
+                    if (
+                        equation_difference is not None
+                        and abs(
+                            equation_difference
+                        ) > 0.002
+                    ):
+                        st.warning(
+                            "El detalle reconstruido difiere del "
+                            f"`consumo_fisico_kg` guardado en "
+                            f"{equation_difference:+.3f} kg. "
+                            "Recalculá metadata antes de usar el dato."
+                        )
+
+                    else:
+                        st.success(
+                            "El detalle fila por fila reconcilia con el "
+                            "consumo físico guardado de la Week."
+                        )
+
+
+                    # Comparación específica de las latas CERRADAS al cierre
+                    closed_at_end = audit_df[
+                        audit_df["Tipo"].eq("CIERRE")
+                        & audit_df["Estado"].fillna("").astype(str).str.upper().eq("CERRADA")
+                    ].copy()
+
+                    if not closed_at_end.empty:
+                        closed_at_end["Nominal 7.800 kg"] = GRIDO_NOMINAL_NET_KG
+                        closed_at_end["Vs 7.800 kg"] = (
+                            pd.to_numeric(closed_at_end["Neto usado kg"], errors="coerce")
+                            - GRIDO_NOMINAL_NET_KG
+                        )
+                        closed_at_end["Desvío %"] = (
+                            closed_at_end["Vs 7.800 kg"]
+                            / GRIDO_NOMINAL_NET_KG
+                            * 100.0
+                        )
+
+                        closed_count = int(len(closed_at_end))
+                        closed_net_total = float(
+                            pd.to_numeric(
+                                closed_at_end["Neto usado kg"],
+                                errors="coerce",
+                            ).fillna(0).sum()
+                        )
+                        closed_nominal_total = (
+                            closed_count * GRIDO_NOMINAL_NET_KG
+                        )
+                        closed_delta_total = (
+                            closed_net_total - closed_nominal_total
+                        )
+                        closed_delta_pct = (
+                            closed_delta_total
+                            / closed_nominal_total
+                            * 100.0
+                            if closed_nominal_total > 0
+                            else None
+                        )
+
+                        st.markdown(
+                            "##### 🧊 Latas CERRADAS al cierre vs 7.800 kg"
+                        )
+                        st.caption(
+                            "Compara solo las latas que quedaron CERRADAS al terminar "
+                            "la Week. En ellas sí tiene sentido contrastar el neto "
+                            "contabilizado contra 7.800 kg nominales por lata. "
+                            "Las ABIERTAS no participan de esta comparación."
+                        )
+
+                        ccl1, ccl2, ccl3, ccl4 = st.columns(4)
+                        ccl1.metric("Cerradas al cierre", closed_count)
+                        ccl2.metric(
+                            "Neto contabilizado",
+                            f"{closed_net_total:.3f} kg",
+                        )
+                        ccl3.metric(
+                            "Nominal esperado",
+                            f"{closed_nominal_total:.3f} kg",
+                            help=(
+                                f"{closed_count} × "
+                                f"{GRIDO_NOMINAL_NET_KG:.3f} kg"
+                            ),
+                        )
+                        ccl4.metric(
+                            "Diferencia vs nominal",
+                            (
+                                f"{closed_delta_total:+.3f} kg"
+                                + (
+                                    f" ({closed_delta_pct:+.2f}%)"
+                                    if closed_delta_pct is not None
+                                    else ""
+                                )
+                            ),
+                        )
+
+                        closed_detail = closed_at_end[
+                            [
+                                "ID salón",
+                                "Sabor",
+                                "Estado",
+                                "Bruto kg",
+                                "Tara aplicada kg",
+                                "Neto usado kg",
+                                "Nominal 7.800 kg",
+                                "Vs 7.800 kg",
+                                "Desvío %",
+                            ]
+                        ].copy()
+
+                        st.dataframe(
+                            closed_detail,
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "Bruto kg": st.column_config.NumberColumn(
+                                    "Bruto", format="%.3f kg"
+                                ),
+                                "Tara aplicada kg": st.column_config.NumberColumn(
+                                    "Tara", format="%.3f kg"
+                                ),
+                                "Neto usado kg": st.column_config.NumberColumn(
+                                    "Neto contabilizado", format="%.3f kg"
+                                ),
+                                "Nominal 7.800 kg": st.column_config.NumberColumn(
+                                    "Nominal", format="%.3f kg"
+                                ),
+                                "Vs 7.800 kg": st.column_config.NumberColumn(
+                                    "Vs 7.800", format="%+.3f kg"
+                                ),
+                                "Desvío %": st.column_config.NumberColumn(
+                                    "Desvío %", format="%+.2f%%"
+                                ),
+                            },
+                        )
+
+                    st.markdown(
+                        "##### 📋 Todas las filas usadas en el balance"
+                    )
+
+                    st.dataframe(
+                        audit_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Bruto kg":
+                                st.column_config.NumberColumn(
+                                    "Bruto",
+                                    format="%.3f kg",
+                                ),
+
+                            "Tara aplicada kg":
+                                st.column_config.NumberColumn(
+                                    "Tara aplicada",
+                                    format="%.3f kg",
+                                ),
+
+                            "Neto usado kg":
+                                st.column_config.NumberColumn(
+                                    "Neto usado",
+                                    format="%.3f kg",
+                                ),
+
+                            "Impacto consumo kg":
+                                st.column_config.NumberColumn(
+                                    "Impacto en consumo",
+                                    format="%+.3f kg",
+                                ),
+                        },
+                    )
+
+                    st.caption(
+                        "Lectura: INICIO suma el stock que existía al "
+                        "arrancar; ENTRADA CÁMARA suma el neto estimado "
+                        "que ingresó; CARGA MANUAL suma ajustes físicos; "
+                        "CIERRE resta lo que todavía quedó en el salón."
+                    )
+
+                    # ================================================
+                    # SEGUNDA LECTURA: QUÉ PASÓ CON LOS IDs
+                    # ================================================
+                    st.markdown(
+                        "##### 🔎 El mismo consumo explicado por continuidad de latas"
+                    )
+
+                    st.caption(
+                        "Esta segunda vista no cambia el cálculo. Reordena "
+                        "los mismos kilos según qué latas ya estaban al inicio, "
+                        "cuáles siguen al cierre y cuáles entraron nuevas desde cámara."
+                    )
+
+                    start_latas_df = pd.DataFrame(
+                        start_snapshot_audit.get(
+                            "latas",
+                            [],
+                        )
+                    )
+
+                    end_latas_df = pd.DataFrame(
+                        end_snapshot_audit.get(
+                            "latas",
+                            [],
+                        )
+                    )
+
+                    if (
+                        not start_latas_df.empty
+                        and not end_latas_df.empty
+                        and "stock_id" in start_latas_df.columns
+                        and "stock_id" in end_latas_df.columns
+                    ):
+                        for _df in [
+                            start_latas_df,
+                            end_latas_df,
+                        ]:
+                            _df["stock_id"] = (
+                                _df["stock_id"]
+                                .fillna("")
+                                .astype(str)
+                                .str.strip()
+                            )
+
+                            _df["peso_neto_kg"] = pd.to_numeric(
+                                _df.get(
+                                    "peso_neto_kg"
+                                ),
+                                errors="coerce",
+                            )
+
+                        start_ids = set(
+                            start_latas_df.loc[
+                                start_latas_df["stock_id"].ne(""),
+                                "stock_id",
+                            ]
+                        )
+
+                        end_ids = set(
+                            end_latas_df.loc[
+                                end_latas_df["stock_id"].ne(""),
+                                "stock_id",
+                            ]
+                        )
+
+                        surviving_ids = (
+                            start_ids
+                            & end_ids
+                        )
+
+                        disappeared_ids = (
+                            start_ids
+                            - end_ids
+                        )
+
+                        new_end_ids = (
+                            end_ids
+                            - start_ids
+                        )
+
+                        surviving_start_kg = float(
+                            start_latas_df.loc[
+                                start_latas_df[
+                                    "stock_id"
+                                ].isin(
+                                    surviving_ids
+                                ),
+                                "peso_neto_kg",
+                            ]
+                            .fillna(0)
+                            .sum()
+                        )
+
+                        surviving_end_kg = float(
+                            end_latas_df.loc[
+                                end_latas_df[
+                                    "stock_id"
+                                ].isin(
+                                    surviving_ids
+                                ),
+                                "peso_neto_kg",
+                            ]
+                            .fillna(0)
+                            .sum()
+                        )
+
+                        surviving_consumed_kg = (
+                            surviving_start_kg
+                            - surviving_end_kg
+                        )
+
+                        disappeared_initial_kg = float(
+                            start_latas_df.loc[
+                                start_latas_df[
+                                    "stock_id"
+                                ].isin(
+                                    disappeared_ids
+                                ),
+                                "peso_neto_kg",
+                            ]
+                            .fillna(0)
+                            .sum()
+                        )
+
+                        new_end_remaining_kg = float(
+                            end_latas_df.loc[
+                                end_latas_df[
+                                    "stock_id"
+                                ].isin(
+                                    new_end_ids
+                                ),
+                                "peso_neto_kg",
+                            ]
+                            .fillna(0)
+                            .sum()
+                        )
+
+                        continuity_consumption = round(
+                            surviving_consumed_kg
+                            + disappeared_initial_kg
+                            + camera_component
+                            + manual_component
+                            - new_end_remaining_kg,
+                            3,
+                        )
+
+                        id1, id2, id3, id4 = st.columns(
+                            4
+                        )
+
+                        id1.metric(
+                            "IDs inicio → cierre",
+                            len(
+                                surviving_ids
+                            ),
+                            help=(
+                                "Latas con el mismo stock_id presentes "
+                                "tanto en el conteo inicial como en el final."
+                            ),
+                        )
+
+                        id2.metric(
+                            "IDs iniciales que salieron",
+                            len(
+                                disappeared_ids
+                            ),
+                            help=(
+                                "Latas que estaban al inicio y ya no "
+                                "aparecen en el conteo final."
+                            ),
+                        )
+
+                        id3.metric(
+                            "IDs nuevos al cierre",
+                            len(
+                                new_end_ids
+                            ),
+                            help=(
+                                "Latas presentes al cierre que no estaban "
+                                "en el snapshot inicial."
+                            ),
+                        )
+
+                        id4.metric(
+                            "Consumo reconciliado",
+                            f"{continuity_consumption:.3f} kg",
+                        )
+
+                        continuity_rows = [
+                            {
+                                "Componente":
+                                    "Consumo de latas que siguen del inicio al cierre",
+                                "Cómo se obtiene":
+                                    (
+                                        f"{surviving_start_kg:.3f} kg inicial "
+                                        f"− {surviving_end_kg:.3f} kg final"
+                                    ),
+                                "Impacto kg":
+                                    surviving_consumed_kg,
+                            },
+                            {
+                                "Componente":
+                                    "Contenido inicial de latas que desaparecieron",
+                                "Cómo se obtiene":
+                                    (
+                                        f"{len(disappeared_ids)} IDs estaban "
+                                        "al inicio y ya no están al cierre"
+                                    ),
+                                "Impacto kg":
+                                    disappeared_initial_kg,
+                            },
+                            {
+                                "Componente":
+                                    "Entradas nuevas desde cámara",
+                                "Cómo se obtiene":
+                                    "Neto usado por el balance semanal",
+                                "Impacto kg":
+                                    camera_component,
+                            },
+                        ]
+
+                        if abs(
+                            manual_component
+                        ) > 0.0005:
+                            continuity_rows.append(
+                                {
+                                    "Componente":
+                                        "Cargas manuales",
+                                    "Cómo se obtiene":
+                                        "Entradas físicas extraordinarias",
+                                    "Impacto kg":
+                                        manual_component,
+                                }
+                            )
+
+                        continuity_rows.append(
+                            {
+                                "Componente":
+                                    "Contenido que todavía queda en IDs nuevos",
+                                "Cómo se obtiene":
+                                    (
+                                        f"{len(new_end_ids)} IDs nuevos "
+                                        "presentes al cierre"
+                                    ),
+                                "Impacto kg":
+                                    -new_end_remaining_kg,
+                            }
+                        )
+
+                        continuity_rows.append(
+                            {
+                                "Componente":
+                                    "CONSUMO FÍSICO",
+                                "Cómo se obtiene":
+                                    "Suma de los componentes anteriores",
+                                "Impacto kg":
+                                    continuity_consumption,
+                            }
+                        )
+
+                        continuity_df = pd.DataFrame(
+                            continuity_rows
+                        )
+
+                        st.dataframe(
+                            continuity_df,
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "Impacto kg":
+                                    st.column_config.NumberColumn(
+                                        "Impacto",
+                                        format="%+.3f kg",
+                                    ),
+                            },
+                        )
+
+                        st.code(
+                            (
+                                f"{surviving_consumed_kg:.3f} kg  "
+                                "consumidos de latas que siguieron\n"
+                                f"+ {disappeared_initial_kg:.3f} kg  "
+                                "de latas iniciales que desaparecieron\n"
+                                f"+ {camera_component:.3f} kg  "
+                                "de entradas desde cámara\n"
+                                + (
+                                    f"+ {manual_component:.3f} kg  "
+                                    "de cargas manuales\n"
+                                    if abs(
+                                        manual_component
+                                    ) > 0.0005
+                                    else ""
+                                )
+                                + f"- {new_end_remaining_kg:.3f} kg  "
+                                "que todavía quedan en IDs nuevos\n"
+                                "────────────────────────────────────\n"
+                                f"= {continuity_consumption:.3f} kg  "
+                                "de consumo físico"
+                            ),
+                            language=None,
+                        )
+
+                        continuity_difference = round(
+                            continuity_consumption
+                            - reconstructed_consumption,
+                            3,
+                        )
+
+                        if abs(
+                            continuity_difference
+                        ) <= 0.002:
+                            st.success(
+                                "La lectura por continuidad de IDs coincide "
+                                "con el balance físico general."
+                            )
+                        else:
+                            st.warning(
+                                "La lectura por IDs difiere del balance "
+                                f"general en {continuity_difference:+.3f} kg. "
+                                "Revisá IDs faltantes, duplicados o movimientos "
+                                "sin correspondencia."
+                            )
+
+                    else:
+                        st.info(
+                            "No hay snapshots inicial/final con stock_id "
+                            "suficientes para mostrar la reconciliación por IDs."
+                        )
+
+        wb1, wb2, wb3, wb4 = st.columns(4)
+
+        _analyzed = _week_num(
+            "nominal_analyzed_latas"
+        )
+        _in_range = _week_num(
+            "nominal_in_range_latas"
+        )
+        _deficit_latas = _week_num(
+            "nominal_deficit_latas"
+        )
+        _in_range_pct = _week_num(
+            "nominal_in_range_pct"
+        )
+
+        wb1.metric(
+            "Latas analizadas",
+            (
+                int(_analyzed)
+                if _analyzed is not None
+                else "-"
+            ),
+        )
+
+        wb2.metric(
+            "En rango o mejor",
+            (
+                int(_in_range)
+                if _in_range is not None
+                else "-"
+            ),
+        )
+
+        wb3.metric(
+            "Déficit claro",
+            (
+                int(_deficit_latas)
+                if _deficit_latas is not None
+                else "-"
+            ),
+        )
+
+        wb4.metric(
+            "% en rango o mejor",
+            (
+                f"{_in_range_pct:.1f}%"
+                if _in_range_pct is not None
+                else "-"
+            ),
+        )
+
+        wc1, wc2, wc3, wc4 = st.columns(4)
+
+        _deficit_total = _week_num(
+            "nominal_deficit_total_kg"
+        )
+        _excess_total = _week_num(
+            "nominal_excess_total_kg"
+        )
+        _balance = _week_num(
+            "nominal_balance_total_kg"
+        )
+        _avg_dev_pct = _week_num(
+            "nominal_avg_deviation_pct"
+        )
+
+        wc1.metric(
+            "Déficit total",
+            (
+                f"{_deficit_total:.3f} kg"
+                if _deficit_total is not None
+                else "-"
+            ),
+        )
+
+        wc2.metric(
+            "Excedente total",
+            (
+                f"{_excess_total:.3f} kg"
+                if _excess_total is not None
+                else "-"
+            ),
+        )
+
+        wc3.metric(
+            "Balance vs nominal",
+            (
+                f"{_balance:+.3f} kg"
+                if _balance is not None
+                else "-"
+            ),
+        )
+
+        wc4.metric(
+            "Desvío promedio %",
+            (
+                f"{_avg_dev_pct:+.2f}%"
+                if _avg_dev_pct is not None
+                else "-"
+            ),
+        )
+
+        st.markdown(
             "#### 📦 Inventario"
         )
 
@@ -11201,6 +14042,191 @@ with tab_weeks:
                     ),
             },
         )
+
+        st.markdown(
+            "#### 🍦 Latas del salón · snapshots"
+        )
+
+        start_salon_snapshot = (
+            salon_snapshot_from_json(
+                selected_week_row.get(
+                    "start_salon_snapshot_json"
+                )
+            )
+        )
+
+        end_salon_snapshot = (
+            salon_snapshot_from_json(
+                selected_week_row.get(
+                    "end_salon_snapshot_json"
+                )
+            )
+        )
+
+        salon_snapshot_tabs = st.tabs(
+            [
+                "🟢 Inicio",
+                "🔴 Cierre",
+            ]
+        )
+
+        for snapshot_tab, snapshot_name, snapshot_data in [
+            (
+                salon_snapshot_tabs[0],
+                "Inicio",
+                start_salon_snapshot,
+            ),
+            (
+                salon_snapshot_tabs[1],
+                "Cierre",
+                end_salon_snapshot,
+            ),
+        ]:
+            with snapshot_tab:
+                if not snapshot_data:
+                    st.info(
+                        f"No hay snapshot de {snapshot_name.lower()} "
+                        "guardado para esta Week."
+                    )
+
+                else:
+                    totals = snapshot_data.get(
+                        "totals",
+                        {},
+                    )
+
+                    ss1, ss2, ss3, ss4 = st.columns(
+                        4
+                    )
+
+                    ss1.metric(
+                        "Latas",
+                        int(
+                            totals.get(
+                                "latas",
+                                0,
+                            )
+                            or 0
+                        ),
+                    )
+
+                    ss2.metric(
+                        "Abiertas",
+                        int(
+                            totals.get(
+                                "abiertas",
+                                0,
+                            )
+                            or 0
+                        ),
+                    )
+
+                    ss3.metric(
+                        "Cerradas",
+                        int(
+                            totals.get(
+                                "cerradas",
+                                0,
+                            )
+                            or 0
+                        ),
+                    )
+
+                    snapshot_total_kg = pd.to_numeric(
+                        pd.Series(
+                            [
+                                totals.get(
+                                    "peso_neto_kg",
+                                    pd.NA,
+                                )
+                            ]
+                        ),
+                        errors="coerce",
+                    ).iloc[0]
+
+                    ss4.metric(
+                        "Kg netos",
+                        (
+                            f"{float(snapshot_total_kg):.3f} kg"
+                            if pd.notna(
+                                snapshot_total_kg
+                            )
+                            else "-"
+                        ),
+                    )
+
+                    snapshot_latas = snapshot_data.get(
+                        "latas",
+                        [],
+                    )
+
+                    if snapshot_latas:
+                        snapshot_df = pd.DataFrame(
+                            snapshot_latas
+                        )
+
+                        display_columns = [
+                            column
+                            for column in [
+                                "stock_id",
+                                "sabor",
+                                "estado",
+                                "peso_bruto_kg",
+                                "tara_kg",
+                                "peso_neto_kg",
+                            ]
+                            if column in snapshot_df.columns
+                        ]
+
+                        st.dataframe(
+                            snapshot_df[
+                                display_columns
+                            ],
+                            hide_index=True,
+                            use_container_width=True,
+                            column_config={
+                                "stock_id":
+                                    st.column_config.TextColumn(
+                                        "ID"
+                                    ),
+
+                                "sabor":
+                                    st.column_config.TextColumn(
+                                        "Sabor"
+                                    ),
+
+                                "estado":
+                                    st.column_config.TextColumn(
+                                        "Estado"
+                                    ),
+
+                                "peso_bruto_kg":
+                                    st.column_config.NumberColumn(
+                                        "Bruto",
+                                        format="%.3f kg",
+                                    ),
+
+                                "tara_kg":
+                                    st.column_config.NumberColumn(
+                                        "Tara",
+                                        format="%.3f kg",
+                                    ),
+
+                                "peso_neto_kg":
+                                    st.column_config.NumberColumn(
+                                        "Neto",
+                                        format="%.3f kg",
+                                    ),
+                            },
+                        )
+
+                    st.caption(
+                        (
+                            f"count_id={snapshot_data.get('count_id') or '-'} · "
+                            f"tipo={snapshot_data.get('count_type') or '-'} · "
+                            f"timestamp={snapshot_data.get('timestamp') or '-'}"
+                        )
+                    )
 
         st.markdown(
             "#### 🧊 Productos en cámara"
