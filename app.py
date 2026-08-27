@@ -89,6 +89,23 @@ for _column in WEEK_SALON_SNAPSHOT_COLUMNS:
 
 
 # ============================================================
+# WEEK SMARTFRAN SALES MIX
+# ============================================================
+
+WEEK_SALES_MIX_COLUMNS = [
+    "sales_mix_snapshot_json",
+    "sales_mix_filename",
+    "sales_mix_loaded_at",
+]
+
+for _column in WEEK_SALES_MIX_COLUMNS:
+    if _column not in WEEK_COLUMNS:
+        WEEK_COLUMNS.append(
+            _column
+        )
+
+
+# ============================================================
 # WEEK MERMA / NOMINAL ANALYTICS
 # ============================================================
 
@@ -2778,6 +2795,711 @@ def salon_snapshot_from_count(
 
 
 # ============================================================
+# SMARTFRAN MIX DE VENTAS
+# ============================================================
+
+SMARTFRAN_MIX_CATEGORIES = [
+    "Gridos",
+    "Helado x Kilo",
+    "Helado x Bocha",
+    "Smoothies",
+]
+
+SMARTFRAN_SMOOTHIE_KG_PER_UNIT = 0.100
+
+
+def _normalize_mix_text(
+    value,
+):
+    if pd.isna(
+        value
+    ):
+        return ""
+
+    return " ".join(
+        str(
+            value
+        )
+        .strip()
+        .split()
+    )
+
+
+def _normalize_mix_column(
+    value,
+):
+    return (
+        _normalize_mix_text(
+            value
+        )
+        .lower()
+        .replace(" ", "")
+        .replace("_", "")
+    )
+
+
+def _mix_numeric_series(
+    series,
+):
+    """
+    Convierte cantidad/kilos a número.
+    Tolera números normales y decimales con coma.
+    """
+
+    if series is None:
+        return pd.Series(
+            dtype=float
+        )
+
+    raw = (
+        series
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+
+    direct = pd.to_numeric(
+        raw,
+        errors="coerce",
+    )
+
+    needs_comma = (
+        direct.isna()
+        & raw.str.contains(
+            ",",
+            regex=False,
+        )
+    )
+
+    if needs_comma.any():
+        comma_values = pd.to_numeric(
+            raw.loc[
+                needs_comma
+            ]
+            .str.replace(
+                ".",
+                "",
+                regex=False,
+            )
+            .str.replace(
+                ",",
+                ".",
+                regex=False,
+            ),
+            errors="coerce",
+        )
+
+        direct.loc[
+            needs_comma
+        ] = comma_values
+
+    return direct.fillna(
+        0.0
+    )
+
+
+def parse_smartfran_mix_dataframe(
+    source_df,
+):
+    """
+    Regla de consumo teórico acordada:
+
+    - Gridos           -> suma de `kilos`
+    - Helado x Kilo    -> suma de `kilos`
+    - Helado x Bocha   -> suma de `kilos`
+    - Smoothies        -> suma de `cantidad` × 0.100 kg
+
+    Todo el resto de categorías se ignora.
+
+    SmartFran actualmente exporta `grudescrip`; también aceptamos
+    `gridodescrip` para compatibilidad con otros exports/nombres.
+    """
+
+    if source_df is None or source_df.empty:
+        raise ValueError(
+            "El Mix de Ventas está vacío."
+        )
+
+    df = source_df.copy()
+
+    normalized_columns = {
+        _normalize_mix_column(
+            column
+        ):
+            column
+        for column in df.columns
+    }
+
+    category_column = None
+
+    for candidate in [
+        "gridodescrip",
+        "grudescrip",
+    ]:
+        candidate_key = _normalize_mix_column(
+            candidate
+        )
+
+        if candidate_key in normalized_columns:
+            category_column = normalized_columns[
+                candidate_key
+            ]
+            break
+
+    quantity_column = normalized_columns.get(
+        _normalize_mix_column(
+            "cantidad"
+        )
+    )
+
+    kilos_column = normalized_columns.get(
+        _normalize_mix_column(
+            "kilos"
+        )
+    )
+
+    missing = []
+
+    if category_column is None:
+        missing.append(
+            "grudescrip/gridodescrip"
+        )
+
+    if quantity_column is None:
+        missing.append(
+            "cantidad"
+        )
+
+    if kilos_column is None:
+        missing.append(
+            "kilos"
+        )
+
+    if missing:
+        raise ValueError(
+            "Faltan columnas requeridas en el Mix de Ventas: "
+            + ", ".join(
+                missing
+            )
+        )
+
+    df[
+        "_mix_category"
+    ] = (
+        df[
+            category_column
+        ]
+        .map(
+            _normalize_mix_text
+        )
+        .str.lower()
+    )
+
+    df[
+        "_mix_quantity"
+    ] = _mix_numeric_series(
+        df[
+            quantity_column
+        ]
+    )
+
+    df[
+        "_mix_kilos"
+    ] = _mix_numeric_series(
+        df[
+            kilos_column
+        ]
+    )
+
+    canonical_lookup = {
+        "gridos":
+            "Gridos",
+
+        "helado x kilo":
+            "Helado x Kilo",
+
+        "helado x bocha":
+            "Helado x Bocha",
+
+        "smoothies":
+            "Smoothies",
+    }
+
+    df[
+        "_canonical_category"
+    ] = df[
+        "_mix_category"
+    ].map(
+        canonical_lookup
+    )
+
+    used_rows = df[
+        df[
+            "_canonical_category"
+        ].notna()
+    ].copy()
+
+    detail_rows = []
+
+    for category in SMARTFRAN_MIX_CATEGORIES:
+        rows = used_rows[
+            used_rows[
+                "_canonical_category"
+            ].eq(
+                category
+            )
+        ].copy()
+
+        # ----------------------------------------------------
+        # SmartFran exporta:
+        #   subgrupo=1 -> filas de artículos
+        #   subgrupo=2 -> subtotal de la categoría
+        #
+        # Si sumamos ambos niveles duplicamos los kilos/cantidades.
+        # Preferimos el subtotal cuando existe; si no, sumamos detalle.
+        # ----------------------------------------------------
+        selected_rows = rows.copy()
+        source_level = "detalle"
+
+        subgroup_column = normalized_columns.get(
+            _normalize_mix_column(
+                "subgrupo"
+            )
+        )
+
+        article_column = normalized_columns.get(
+            _normalize_mix_column(
+                "artdescrip"
+            )
+        )
+
+        if (
+            subgroup_column is not None
+            and subgroup_column in rows.columns
+        ):
+            subgroup_values = pd.to_numeric(
+                rows[
+                    subgroup_column
+                ],
+                errors="coerce",
+            )
+
+            subtotal_rows = rows[
+                subgroup_values.eq(
+                    2
+                )
+            ].copy()
+
+            if not subtotal_rows.empty:
+                selected_rows = subtotal_rows
+                source_level = "subtotal SmartFran"
+
+        elif (
+            article_column is not None
+            and article_column in rows.columns
+        ):
+            subtotal_rows = rows[
+                rows[
+                    article_column
+                ].isna()
+            ].copy()
+
+            if not subtotal_rows.empty:
+                selected_rows = subtotal_rows
+                source_level = "subtotal SmartFran"
+
+        quantity = float(
+            selected_rows[
+                "_mix_quantity"
+            ].sum()
+        )
+
+        source_kilos = float(
+            selected_rows[
+                "_mix_kilos"
+            ].sum()
+        )
+
+        if category == "Smoothies":
+            theoretical_kg = (
+                quantity
+                * SMARTFRAN_SMOOTHIE_KG_PER_UNIT
+            )
+
+            rule = (
+                "cantidad × 0.100 kg"
+            )
+
+        else:
+            theoretical_kg = source_kilos
+            rule = "kilos SmartFran"
+
+        detail_rows.append(
+            {
+                "categoria":
+                    category,
+
+                "cantidad":
+                    round(
+                        quantity,
+                        3,
+                    ),
+
+                "kilos_smartfran":
+                    round(
+                        source_kilos,
+                        3,
+                    ),
+
+                "consumo_teorico_kg":
+                    round(
+                        theoretical_kg,
+                        3,
+                    ),
+
+                "regla":
+                    rule,
+
+                "filas":
+                    int(
+                        len(
+                            selected_rows
+                        )
+                    ),
+
+                "nivel_fuente":
+                    source_level,
+            }
+        )
+
+    detail_df = pd.DataFrame(
+        detail_rows
+    )
+
+    total_consumo_teorico_kg = round(
+        float(
+            detail_df[
+                "consumo_teorico_kg"
+            ].sum()
+        ),
+        3,
+    )
+
+    snapshot = {
+        "categories":
+            detail_rows,
+
+        "total_consumo_teorico_kg":
+            total_consumo_teorico_kg,
+
+        "source_rows":
+            int(
+                len(
+                    df
+                )
+            ),
+
+        "used_rows":
+            int(
+                len(
+                    used_rows
+                )
+            ),
+
+        "ignored_rows":
+            int(
+                len(
+                    df
+                )
+                - len(
+                    used_rows
+                )
+            ),
+
+        "category_column":
+            str(
+                category_column
+            ),
+
+        "quantity_column":
+            str(
+                quantity_column
+            ),
+
+        "kilos_column":
+            str(
+                kilos_column
+            ),
+    }
+
+    return (
+        detail_df,
+        snapshot,
+    )
+
+
+def parse_smartfran_mix_upload(
+    uploaded_file,
+):
+    if uploaded_file is None:
+        raise ValueError(
+            "No se seleccionó ningún archivo."
+        )
+
+    raw = uploaded_file.getvalue()
+
+    if not raw:
+        raise ValueError(
+            "El archivo seleccionado está vacío."
+        )
+
+    last_error = None
+
+    # Primero intentamos autodetección de separador.
+    for kwargs in [
+        {
+            "sep": None,
+            "engine": "python",
+        },
+        {
+            "sep": ",",
+        },
+        {
+            "sep": ";",
+        },
+    ]:
+        try:
+            candidate = pd.read_csv(
+                BytesIO(
+                    raw
+                ),
+                **kwargs,
+            )
+
+            if candidate.shape[
+                1
+            ] >= 3:
+                return parse_smartfran_mix_dataframe(
+                    candidate
+                )
+
+        except Exception as exc:
+            last_error = exc
+
+    raise ValueError(
+        "No se pudo interpretar el CSV de SmartFran."
+        + (
+            f" Detalle: {last_error}"
+            if last_error is not None
+            else ""
+        )
+    )
+
+
+def sales_mix_snapshot_to_json(
+    snapshot,
+):
+    return json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        separators=(
+            ",",
+            ":",
+        ),
+        sort_keys=True,
+    )
+
+
+def sales_mix_snapshot_from_json(
+    value,
+):
+    if value is None:
+        return {}
+
+    try:
+        if pd.isna(
+            value
+        ):
+            return {}
+    except Exception:
+        pass
+
+    if isinstance(
+        value,
+        dict,
+    ):
+        return value
+
+    raw = str(
+        value
+    ).strip()
+
+    if (
+        not raw
+        or raw.lower()
+        in {
+            "nan",
+            "none",
+            "<na>",
+        }
+    ):
+        return {}
+
+    try:
+        parsed = json.loads(
+            raw
+        )
+
+        return (
+            parsed
+            if isinstance(
+                parsed,
+                dict,
+            )
+            else {}
+        )
+
+    except Exception:
+        return {}
+
+
+def save_week_sales_mix(
+    week_id,
+    *,
+    snapshot,
+    filename,
+):
+    weeks_df = load_weeks()
+
+    mask = (
+        weeks_df[
+            "week_id"
+        ]
+        .astype(str)
+        .eq(
+            str(
+                week_id
+            )
+        )
+    )
+
+    if not mask.any():
+        raise ValueError(
+            "No se encontró la Week."
+        )
+
+    idx = weeks_df[
+        mask
+    ].index[0]
+
+    status = str(
+        weeks_df.loc[
+            idx,
+            "status"
+        ]
+    ).upper()
+
+    if status != "CLOSED":
+        raise ValueError(
+            "El Mix de Ventas solo se puede guardar en una Week cerrada."
+        )
+
+    total_teorico = pd.to_numeric(
+        snapshot.get(
+            "total_consumo_teorico_kg"
+        ),
+        errors="coerce",
+    )
+
+    if pd.isna(
+        total_teorico
+    ):
+        raise ValueError(
+            "No se pudo calcular el consumo teórico del Mix."
+        )
+
+    consumo_fisico = pd.to_numeric(
+        weeks_df.loc[
+            idx,
+            "consumo_fisico_kg"
+        ],
+        errors="coerce",
+    )
+
+    weeks_df.loc[
+        idx,
+        "consumo_teorico_kg"
+    ] = round(
+        float(
+            total_teorico
+        ),
+        3,
+    )
+
+    weeks_df.loc[
+        idx,
+        "sales_mix_snapshot_json"
+    ] = sales_mix_snapshot_to_json(
+        snapshot
+    )
+
+    weeks_df.loc[
+        idx,
+        "sales_mix_filename"
+    ] = str(
+        filename
+        or ""
+    )
+
+    weeks_df.loc[
+        idx,
+        "sales_mix_loaded_at"
+    ] = now_iso()
+
+    if pd.notna(
+        consumo_fisico
+    ):
+        merma_kg = round(
+            float(
+                consumo_fisico
+            )
+            - float(
+                total_teorico
+            ),
+            3,
+        )
+
+        weeks_df.loc[
+            idx,
+            "merma_kg"
+        ] = merma_kg
+
+        if float(
+            total_teorico
+        ) > 0:
+            weeks_df.loc[
+                idx,
+                "merma_pct"
+            ] = round(
+                (
+                    merma_kg
+                    / float(
+                        total_teorico
+                    )
+                )
+                * 100.0,
+                3,
+            )
+
+    safe_write_csv(
+        weeks_df[
+            WEEK_COLUMNS
+        ],
+        WEEKS_FILE,
+    )
+
+
+# ============================================================
 # WEEKS
 # ============================================================
 
@@ -3621,6 +4343,61 @@ def refresh_all_metadata(
             now_iso=now_iso(),
         )
     )
+
+    # --------------------------------------------------------
+    # Preserve SmartFran Mix metadata stored on each Week.
+    # week_service recalculates core Week fields, but these app-owned
+    # snapshot fields must remain frozen once the Mix was loaded.
+    # --------------------------------------------------------
+
+    for mix_column in WEEK_SALES_MIX_COLUMNS:
+        if mix_column not in refreshed_weeks.columns:
+            refreshed_weeks[
+                mix_column
+            ] = pd.NA
+
+    if not weeks.empty:
+        existing_mix_by_week = {
+            str(
+                row.get(
+                    "week_id",
+                    ""
+                )
+            ): {
+                column:
+                    row.get(
+                        column,
+                        pd.NA,
+                    )
+                for column in WEEK_SALES_MIX_COLUMNS
+            }
+            for _, row in weeks.iterrows()
+        }
+
+        for idx, refreshed_row in refreshed_weeks.iterrows():
+            existing_mix = existing_mix_by_week.get(
+                str(
+                    refreshed_row.get(
+                        "week_id",
+                        ""
+                    )
+                ),
+                {},
+            )
+
+            for column in WEEK_SALES_MIX_COLUMNS:
+                value = existing_mix.get(
+                    column,
+                    pd.NA,
+                )
+
+                if pd.notna(
+                    value
+                ):
+                    refreshed_weeks.loc[
+                        idx,
+                        column,
+                    ] = value
 
     # --------------------------------------------------------
     # Persisted Week merma / nominal analytics
@@ -12839,6 +13616,400 @@ with tab_weeks:
                 ""
             )
         ).upper() == "CLOSED":
+
+            # ====================================================
+            # SMARTFRAN MIX DE VENTAS
+            # ====================================================
+            st.markdown(
+                "#### 🧾 Mix de Ventas SmartFran"
+            )
+
+            st.caption(
+                "Cargá el CSV correspondiente a esta Week cerrada. "
+                "Para consumo teórico se usan únicamente: Gridos, "
+                "Helado x Kilo y Helado x Bocha por su columna `kilos`; "
+                "Smoothies se convierte a 0.100 kg por unidad vendida."
+            )
+
+            saved_mix_snapshot = sales_mix_snapshot_from_json(
+                selected_week_row.get(
+                    "sales_mix_snapshot_json"
+                )
+            )
+
+            saved_mix_filename = str(
+                selected_week_row.get(
+                    "sales_mix_filename",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            saved_mix_loaded_at = str(
+                selected_week_row.get(
+                    "sales_mix_loaded_at",
+                    ""
+                )
+                or ""
+            ).strip()
+
+            if saved_mix_snapshot:
+                saved_categories = saved_mix_snapshot.get(
+                    "categories",
+                    [],
+                )
+
+                if saved_categories:
+                    saved_mix_df = pd.DataFrame(
+                        saved_categories
+                    )
+
+                    saved_mix_df = saved_mix_df.rename(
+                        columns={
+                            "categoria":
+                                "Categoría",
+
+                            "cantidad":
+                                "Cantidad",
+
+                            "kilos_smartfran":
+                                "Kilos SmartFran",
+
+                            "consumo_teorico_kg":
+                                "Kg computados",
+
+                            "regla":
+                                "Regla",
+
+                            "filas":
+                                "Filas",
+
+                            "nivel_fuente":
+                                "Fuente",
+                        }
+                    )
+
+                    st.dataframe(
+                        saved_mix_df,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Cantidad":
+                                st.column_config.NumberColumn(
+                                    format="%.3f",
+                                ),
+
+                            "Kilos SmartFran":
+                                st.column_config.NumberColumn(
+                                    format="%.3f kg",
+                                ),
+
+                            "Kg computados":
+                                st.column_config.NumberColumn(
+                                    format="%.3f kg",
+                                ),
+                        },
+                    )
+
+                saved_teorico = pd.to_numeric(
+                    selected_week_row.get(
+                        "consumo_teorico_kg"
+                    ),
+                    errors="coerce",
+                )
+
+                saved_fisico = pd.to_numeric(
+                    selected_week_row.get(
+                        "consumo_fisico_kg"
+                    ),
+                    errors="coerce",
+                )
+
+                saved_merma = pd.to_numeric(
+                    selected_week_row.get(
+                        "merma_kg"
+                    ),
+                    errors="coerce",
+                )
+
+                saved_merma_pct = pd.to_numeric(
+                    selected_week_row.get(
+                        "merma_pct"
+                    ),
+                    errors="coerce",
+                )
+
+                sm1, sm2, sm3, sm4 = st.columns(
+                    4
+                )
+
+                sm1.metric(
+                    "Consumo físico",
+                    (
+                        f"{float(saved_fisico):.3f} kg"
+                        if pd.notna(
+                            saved_fisico
+                        )
+                        else "-"
+                    ),
+                )
+
+                sm2.metric(
+                    "Consumo teórico SmartFran",
+                    (
+                        f"{float(saved_teorico):.3f} kg"
+                        if pd.notna(
+                            saved_teorico
+                        )
+                        else "-"
+                    ),
+                )
+
+                sm3.metric(
+                    "Diferencia / merma",
+                    (
+                        f"{float(saved_merma):+.3f} kg"
+                        if pd.notna(
+                            saved_merma
+                        )
+                        else "-"
+                    ),
+                    help=(
+                        "Consumo físico − consumo teórico según SmartFran."
+                    ),
+                )
+
+                sm4.metric(
+                    "Merma %",
+                    (
+                        f"{float(saved_merma_pct):+.2f}%"
+                        if pd.notna(
+                            saved_merma_pct
+                        )
+                        else "-"
+                    ),
+                    help=(
+                        "Merma kg / consumo teórico SmartFran × 100."
+                    ),
+                )
+
+                if (
+                    saved_mix_filename
+                    or saved_mix_loaded_at
+                ):
+                    st.caption(
+                        (
+                            f"Mix guardado: "
+                            f"{saved_mix_filename or '-'}"
+                            f" · cargado: "
+                            f"{saved_mix_loaded_at or '-'}"
+                        )
+                    )
+
+            else:
+                st.info(
+                    "Esta Week todavía no tiene un Mix de Ventas cargado."
+                )
+
+            mix_upload = st.file_uploader(
+                "Cargar / reemplazar Mix de Ventas (.csv)",
+                type=[
+                    "csv"
+                ],
+                key=(
+                    "week_sales_mix_upload_"
+                    + str(
+                        selected_week_row.get(
+                            "week_id"
+                        )
+                    )
+                ),
+            )
+
+            if mix_upload is not None:
+                try:
+                    preview_mix_df, preview_mix_snapshot = (
+                        parse_smartfran_mix_upload(
+                            mix_upload
+                        )
+                    )
+
+                    preview_total = float(
+                        preview_mix_snapshot[
+                            "total_consumo_teorico_kg"
+                        ]
+                    )
+
+                    st.markdown(
+                        "##### 🔍 Vista previa"
+                    )
+
+                    preview_display = preview_mix_df.rename(
+                        columns={
+                            "categoria":
+                                "Categoría",
+
+                            "cantidad":
+                                "Cantidad",
+
+                            "kilos_smartfran":
+                                "Kilos SmartFran",
+
+                            "consumo_teorico_kg":
+                                "Kg computados",
+
+                            "regla":
+                                "Regla",
+
+                            "filas":
+                                "Filas",
+
+                            "nivel_fuente":
+                                "Fuente",
+                        }
+                    )
+
+                    st.dataframe(
+                        preview_display,
+                        hide_index=True,
+                        use_container_width=True,
+                        column_config={
+                            "Cantidad":
+                                st.column_config.NumberColumn(
+                                    format="%.3f",
+                                ),
+
+                            "Kilos SmartFran":
+                                st.column_config.NumberColumn(
+                                    format="%.3f kg",
+                                ),
+
+                            "Kg computados":
+                                st.column_config.NumberColumn(
+                                    format="%.3f kg",
+                                ),
+                        },
+                    )
+
+                    physical_preview = pd.to_numeric(
+                        selected_week_row.get(
+                            "consumo_fisico_kg"
+                        ),
+                        errors="coerce",
+                    )
+
+                    preview_merma = (
+                        float(
+                            physical_preview
+                        )
+                        - preview_total
+                        if pd.notna(
+                            physical_preview
+                        )
+                        else None
+                    )
+
+                    preview_merma_pct = (
+                        preview_merma
+                        / preview_total
+                        * 100.0
+                        if (
+                            preview_merma is not None
+                            and preview_total > 0
+                        )
+                        else None
+                    )
+
+                    pm1, pm2, pm3 = st.columns(
+                        3
+                    )
+
+                    pm1.metric(
+                        "Consumo teórico del archivo",
+                        f"{preview_total:.3f} kg",
+                    )
+
+                    pm2.metric(
+                        "Diferencia vs consumo físico",
+                        (
+                            f"{preview_merma:+.3f} kg"
+                            if preview_merma is not None
+                            else "-"
+                        ),
+                    )
+
+                    pm3.metric(
+                        "Diferencia %",
+                        (
+                            f"{preview_merma_pct:+.2f}%"
+                            if preview_merma_pct is not None
+                            else "-"
+                        ),
+                    )
+
+                    st.caption(
+                        (
+                            f"Filas del CSV: "
+                            f"{preview_mix_snapshot['source_rows']} · "
+                            f"usadas: "
+                            f"{preview_mix_snapshot['used_rows']} · "
+                            f"ignoradas: "
+                            f"{preview_mix_snapshot['ignored_rows']}"
+                        )
+                    )
+
+                    if st.button(
+                        (
+                            "💾 Guardar Mix en "
+                            + str(
+                                selected_week_row.get(
+                                    "week_id"
+                                )
+                            )
+                        ),
+                        type="primary",
+                        key=(
+                            "save_week_sales_mix_"
+                            + str(
+                                selected_week_row.get(
+                                    "week_id"
+                                )
+                            )
+                        ),
+                    ):
+                        ok, _ = run_ui_mutation(
+                            running_label=
+                                "Guardando Mix de Ventas...",
+
+                            success_label=
+                                "Mix guardado y merma recalculada.",
+
+                            error_label=
+                                "No se pudo guardar el Mix de Ventas.",
+
+                            operation=
+                                lambda:
+                                    save_week_sales_mix(
+                                        selected_week_row.get(
+                                            "week_id"
+                                        ),
+                                        snapshot=
+                                            preview_mix_snapshot,
+                                        filename=
+                                            mix_upload.name,
+                                    ),
+                        )
+
+                        if ok:
+                            st.rerun()
+
+                except Exception as exc:
+                    st.error(
+                        f"No se pudo interpretar el Mix: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+            st.divider()
 
             with st.expander(
                 "🧾 Ver detalle exacto del cálculo de consumo físico",
